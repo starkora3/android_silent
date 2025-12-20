@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:padding="12dp">
+
+    <ImageView
+        android:id="@+id/thumb"
+        android:layout_width="80dp"
+        android:layout_height="80dp"
+        android:scaleType="centerCrop"
+        android:contentDescription="thumbnail"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <TextView
+        android:id="@+id/videoName"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="Video name"
+        android:textSize="16sp"
+        app:layout_constraintStart_toEndOf="@id/thumb"
+        app:layout_constraintTop_toTopOf="@id/thumb"
+        app:layout_constraintEnd_toStartOf="@id/btnPlay"
+        android:layout_marginStart="8dp" />
+
+    <TextView
+        android:id="@+id/videoUri"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="uri"
+        android:textSize="12sp"
+        app:layout_constraintStart_toEndOf="@id/thumb"
+        app:layout_constraintTop_toBottomOf="@id/videoName"
+        app:layout_constraintEnd_toStartOf="@id/btnPlay"
+        app:layout_constraintBottom_toBottomOf="@id/thumb"
+        android:layout_marginStart="8dp" />
+
+    <ImageButton
+        android:id="@+id/btnPlay"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:src="@android:drawable/ic_media_play"
+        android:contentDescription="play"
+        app:layout_constraintEnd_toStartOf="@id/btnShare"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <ImageButton
+        android:id="@+id/btnShare"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:src="@android:drawable/ic_menu_share"
+        android:contentDescription="share"
+        app:layout_constraintEnd_toStartOf="@id/btnDelete"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <ImageButton
+        android:id="@+id/btnDelete"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:src="@android:drawable/ic_menu_delete"
+        android:contentDescription="delete"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

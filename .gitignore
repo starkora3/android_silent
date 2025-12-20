@@ -1,0 +1,84 @@
+# Gradle files
+.gradle/
+build/
+**/build/
+
+# Gradle wrapper
+/gradle/wrapper/gradle-wrapper.jar
+
+# Local configuration
+/local.properties
+
+# Android Studio
+/.idea/
+*.iml
+.idea/*
+!.idea/gradle.xml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Kotlin/Java
+*.class
+*.log
+
+# Generated files
+/captures/
+/out/
+
+# NDK
+.cxx/
+.externalNativeBuild/
+obj/
+
+# Signing
+*.jks
+*.keystore
+keystore.properties
+
+# Keystore and secrets
+*.properties
+# If you keep other secrets, consider explicitly ignoring them
+
+# Google services
+google-services.json
+
+# Misc
+*.apk
+*.ap_
+*.aab
+*.dex
+
+# IDE - VSCode
+.vscode/
+
+# JetBrains specific
+.idea
+*.iws
+*.ipr
+
+# Intellij
+*.iml
+
+# Ignore the Android Studio profiler output
+**/captures/
+
+# Exclude proguard generated mapping if you want it private
+/mapping.txt
+
+# Keep track of gradle daemon locks and caches
+.gradle/
+
+# Temporary files
+*~
+*.swp
+
+# Build results of the NDK
+obj/
+
+# Other
+local.properties
+
+# End of file
+

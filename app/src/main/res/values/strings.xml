@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Silent</string>
+    <string name="record_start">録画開始</string>
+    <string name="record_stop">録画停止</string>
+    <string name="mic_allowed">マイク: 許可済み（音声あり）</string>
+    <string name="mic_denied">マイク: 許可なし（音声無し） - 設定で許可</string>
+    <string name="record_started">録画を開始しました</string>
+    <string name="view_list">録画一覧</string>
+</resources>
