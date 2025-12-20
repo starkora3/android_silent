@@ -27,6 +27,17 @@
         android:layout_marginStart="8dp" />
 
     <TextView
+        android:id="@+id/videoDuration"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="0:00"
+        android:textSize="12sp"
+        android:textColor="@android:color/darker_gray"
+        app:layout_constraintEnd_toStartOf="@id/btnPlay"
+        app:layout_constraintTop_toTopOf="@id/btnPlay"
+        android:layout_marginEnd="8dp" />
+
+    <TextView
         android:id="@+id/videoUri"
         android:layout_width="0dp"
         android:layout_height="wrap_content"

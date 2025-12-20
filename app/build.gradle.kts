@@ -5,14 +5,14 @@ plugins {
 
 android {
     namespace = "com.example.silent"
-    compileSdk {
-        version = release(36)
-    }
+    // compileSdk should be an integer value
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.silent"
-        minSdk = 35
-        targetSdk = 36
+        // Lower minSdk so the app can run on more real devices (CameraX requires API 21+)
+        minSdk = 31
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
@@ -35,6 +35,8 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+    buildToolsVersion = "36.0.0"
+    ndkVersion = "29.0.14206865"
 }
 
 dependencies {
@@ -55,7 +57,14 @@ dependencies {
     // RecyclerView
     implementation(libs.androidx.recyclerview)
 
+    // Glide for thumbnails
+    implementation("com.github.bumptech.glide:glide:4.15.1")
+
     // ExoPlayer
     implementation("com.google.android.exoplayer:exoplayer-core:2.19.0")
     implementation("com.google.android.exoplayer:exoplayer-ui:2.19.0")
+
+    // Lifecycle service for background recording
+    implementation("androidx.lifecycle:lifecycle-service:2.6.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.1")
 }

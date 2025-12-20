@@ -3,10 +3,22 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- パーミッション -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Foreground service permission required to call startForeground on some Android versions/ROMs -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Android 10 (API 29) 未満で外部ストレージ書き込みが必要な場合 -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+
+    <!-- 動画一覧を読み取るためのパーミッション -->
+    <!-- Android 13+ では READ_MEDIA_VIDEO を要求する -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
 
     <application
         android:allowBackup="true"
@@ -28,6 +40,10 @@
 
         <activity android:name=".VideoListActivity" android:exported="false" />
         <activity android:name=".PlayerActivity" android:exported="false" />
+        <service android:name=".RecordingService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone"
+            tools:ignore="ForegroundServicePermission" />
 
     </application>
 
