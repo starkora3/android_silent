@@ -34,6 +34,11 @@ import android.os.Handler
 import android.os.Looper
 import android.Manifest
 import android.content.pm.PackageManager
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ClickableSpan
+import android.text.method.LinkMovementMethod
+import android.widget.Toast
 
 class MainActivity : AppCompatActivity() {
 
@@ -43,6 +48,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rootLayout: ViewGroup
     private lateinit var viewListButton: View
     private lateinit var recordingTimer: TextView
+    private lateinit var logView: TextView
+    private lateinit var navigateButton: View
 
     private var videoCapture: VideoCapture<Recorder>? = null
 
@@ -72,6 +79,7 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.removeCallbacks(updateRunnable)
                     recordingTimer.text = formatMs(0L)
                 }
+                appendLog("Service connected. isRecording=$isRec")
             }
         }
 
@@ -82,6 +90,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 recordButton.text = getString(R.string.record_start)
                 recordingTimer.text = formatMs(0L)
+                appendLog("Service disconnected")
             }
         }
     }
@@ -90,12 +99,14 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
         val granted = perms[Manifest.permission.CAMERA] == true
+        appendLog("Camera permission result: $granted")
         if (granted) startCamera()
     }
 
     // Notification permission launcher (Android 13+)
     private var pendingStartAfterNotifPerm = false // 保留フラグ: ユーザーが録画開始を押して通知許可が必要な場合に true
     private val notifPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        appendLog("Notification permission result: $granted")
         if (!granted) {
             // show snackbar to open settings
             val parent = findViewById<View>(android.R.id.content)
@@ -122,6 +133,7 @@ class MainActivity : AppCompatActivity() {
     // Foreground service permission launcher (some devices/ROMs enforce runtime checks). Only request on Android 12+ if needed.
     private var pendingStartAfterFgsPerm = false
     private val fgsPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        appendLog("Foreground-service permission result: $granted")
         if (!granted) {
             // show guidance to open settings
             val parent = findViewById<View>(android.R.id.content)
@@ -207,6 +219,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 snack.show()
+                appendLog("Notification permission required (received broadcast)")
             }
         }
     }
@@ -219,11 +232,32 @@ class MainActivity : AppCompatActivity() {
                     RecordingService.ACTION_RECORDING_STARTED -> {
                         recordButton.text = getString(R.string.record_stop)
                         mainHandler.post(updateRunnable)
+                        appendLog("Recording started")
                     }
                     RecordingService.ACTION_RECORDING_STOPPED -> {
                         recordButton.text = getString(R.string.record_start)
                         mainHandler.removeCallbacks(updateRunnable)
                         recordingTimer.text = formatMs(0L)
+                        appendLog("Recording stopped")
+                    }
+                    RecordingService.ACTION_RECORDING_SAVED -> {
+                        // Activity receives the saved URI from the service and logs it for user visibility
+                        val uriStr = intent?.getStringExtra("video_uri")
+                        if (!uriStr.isNullOrEmpty()) {
+                            appendLog("Recording saved: $uriStr")
+                            try {
+                                val parent = findViewById<View>(android.R.id.content)
+                                Snackbar.make(parent, "録画を保存しました", Snackbar.LENGTH_SHORT)
+                                    .setAction("開く") {
+                                        try { openUri(Uri.parse(uriStr)) } catch (_: Exception) {}
+                                    }
+                                    .show()
+                                // Add a clickable entry in the log so user can tap the URI
+                                try { appendClickableUri(Uri.parse(uriStr)) } catch (e: Exception) { appendLog("appendClickableUri failed: ${e.message}") }
+                            } catch (_: Exception) { }
+                        } else {
+                            appendLog("Recording saved (no URI provided)")
+                        }
                     }
                 }
             }
@@ -243,10 +277,28 @@ class MainActivity : AppCompatActivity() {
                     }
                 try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
                 snack.show()
+                appendLog("Foreground-service permission required (received broadcast)")
                 // attempt to ask runtime permission if applicable
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     pendingStartAfterFgsPerm = true
                     try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) { /* some ROMs don't allow runtime request for this; settings guidance above will help */ }
+                }
+            }
+        }
+    }
+
+    // Receiver for camera permission required broadcast from service
+    private val cameraPermReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                // Request camera permission using existing launcher
+                try {
+                    permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+                    appendLog("Camera permission requested via receiver")
+                } catch (e: Exception) {
+                    android.util.Log.w("MainActivity", "failed to launch camera permission request", e)
+                    appendLog("Failed to launch camera permission request: ${e.message}")
                 }
             }
         }
@@ -262,6 +314,7 @@ class MainActivity : AppCompatActivity() {
         val stateFilter = IntentFilter().apply {
             addAction(RecordingService.ACTION_RECORDING_STARTED)
             addAction(RecordingService.ACTION_RECORDING_STOPPED)
+            addAction(RecordingService.ACTION_RECORDING_SAVED) // added: receive saved URI broadcasts
         }
         try { registerReceiver(recordingStateReceiver, stateFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver state failed", e) }
 
@@ -276,6 +329,10 @@ class MainActivity : AppCompatActivity() {
         // register receiver for foreground-permission-required broadcasts
         val fgsFilter = IntentFilter(RecordingService.ACTION_FOREGROUND_PERMISSION_REQUIRED)
         try { registerReceiver(fgsPermReceiver, fgsFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver fgs failed", e) }
+        // register receiver for camera-permission-required broadcasts
+        val camFilter = IntentFilter(RecordingService.ACTION_CAMERA_PERMISSION_REQUIRED)
+        try { registerReceiver(cameraPermReceiver, camFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver camera failed", e) }
+        appendLog("onStart: receivers registered and service bind attempted")
     }
 
     override fun onStop() {
@@ -288,6 +345,8 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(notifPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(recordingStateReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(fgsPermReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(cameraPermReceiver) } catch (_: Exception) {}
+        appendLog("onStop: unbound and receivers unregistered")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -299,7 +358,25 @@ class MainActivity : AppCompatActivity() {
         audioStatus = findViewById(R.id.audioStatus)
         rootLayout = findViewById(R.id.rootLayout)
         viewListButton = findViewById(R.id.btnViewList)
+        navigateButton = findViewById(R.id.btnNavigate)
         recordingTimer = findViewById(R.id.recordingTimer)
+        logView = findViewById(R.id.logView)
+
+        navigateButton.setOnClickListener {
+            try {
+                val intent = Intent(this, SecondActivity::class.java)
+                startActivity(intent)
+            } catch (e: Exception) {
+                appendLog("Failed to navigate: ${e.message}")
+            }
+        }
+
+        // Enable clickable links in the log view so saved URIs can be tapped
+        try {
+            logView.movementMethod = LinkMovementMethod.getInstance()
+            logView.isClickable = true
+            logView.linksClickable = true
+        } catch (_: Exception) {}
 
         // WindowInsets を監視してナビバー領域分をボタンの下マージンに追加
         val baseMargin = resources.getDimensionPixelSize(R.dimen.record_button_bottom_margin)
@@ -311,6 +388,8 @@ class MainActivity : AppCompatActivity() {
             }
             insets
         }
+
+        appendLog("onCreate: UI initialized")
 
         audioStatus.setOnClickListener {
             // 設定画面を開く
@@ -348,6 +427,7 @@ class MainActivity : AppCompatActivity() {
                     }, 500)
                 } catch (e: Exception) {
                     android.util.Log.w("MainActivity", "failed to temporarily disable recordButton", e)
+                    appendLog("failed to temporarily disable recordButton: ${e.message}")
                 }
             }
 
@@ -380,6 +460,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (needed.isNotEmpty()) {
             permissionLauncher.launch(needed.toTypedArray())
+            appendLog("Requesting permissions: ${needed.joinToString()}")
         } else {
             startCamera()
         }
@@ -402,8 +483,10 @@ class MainActivity : AppCompatActivity() {
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, videoCapture)
+                appendLog("Camera started and bound to lifecycle")
             } catch (e: Exception) {
                 e.printStackTrace()
+                appendLog("Failed to start camera: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -434,6 +517,28 @@ class MainActivity : AppCompatActivity() {
 
                 // ensure button gets re-enabled since we are not proceeding to start service
                 try { recordButton.isEnabled = true } catch (_: Exception) {}
+                appendLog("Notification permission required before starting recording")
+                return
+            }
+        }
+
+        // Ensure FOREGROUND_SERVICE permission on Android 12+ before starting service
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
+                // request and remember intent
+                pendingStartAfterFgsPerm = true
+                try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) { /* some ROMs disallow runtime request */ }
+
+                val parent = findViewById<View>(android.R.id.content)
+                val snack = Snackbar.make(parent, "録画の開始にはフォアグラウンドサービス権限が必要です", Snackbar.LENGTH_INDEFINITE)
+                    .setAction("許可") {
+                        try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) {}
+                    }
+                try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
+                snack.show()
+
+                try { recordButton.isEnabled = true } catch (_: Exception) {}
+                appendLog("Foreground service permission required before starting recording")
                 return
             }
         }
@@ -450,10 +555,12 @@ class MainActivity : AppCompatActivity() {
             try {
                 try {
                     startService(intent)
+                    appendLog("startService called")
                 } catch (e: IllegalStateException) {
                     android.util.Log.w("MainActivity", "startService threw IllegalStateException, trying startForegroundService", e)
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         startForegroundService(intent)
+                        appendLog("startForegroundService used after IllegalStateException")
                     } else {
                         throw e
                     }
@@ -462,6 +569,7 @@ class MainActivity : AppCompatActivity() {
                 android.util.Log.w("MainActivity", "service start failed, attempting fallback", inner)
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+                    appendLog("Fallback service start attempted")
                 } catch (inner2: Exception) {
                     throw RuntimeException("All service start attempts failed", inner2)
                 }
@@ -475,9 +583,11 @@ class MainActivity : AppCompatActivity() {
                 val lp = snackView.layoutParams
                 if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; snackView.layoutParams = lp }
                 snackbar.show()
+                appendLog("Snackbar shown: starting recording")
             } catch (_: Exception) { }
         } catch (e: Throwable) {
             android.util.Log.e("MainActivity", "Failed to start recording service (Throwable)", e)
+            appendLog("Failed to start recording service: ${e.message}")
             try {
                 val parent = findViewById<View>(android.R.id.content)
                 val s = Snackbar.make(parent, "録画サービスを開始できませんでした。設定で権限を確認してください", Snackbar.LENGTH_INDEFINITE)
@@ -499,11 +609,74 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_STOP }
         try {
             startService(intent)
+            appendLog("stopService requested")
         } catch (e: Exception) {
             android.widget.Toast.makeText(this, "録画停止に失敗しました: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+            appendLog("Failed to request stopService: ${e.message}")
         }
         recordButton.text = getString(R.string.record_start)
         updateAudioStatus()
+    }
+
+    // Append a line to the on-screen log and scroll to bottom. Thread-safe.
+    private fun appendLog(line: String) {
+        try {
+            runOnUiThread {
+                try {
+                    val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+                    logView.append("[$time] $line\n")
+                    // scroll parent ScrollView to bottom
+                    val sv = findViewById<android.widget.ScrollView>(R.id.logScroll)
+                    sv.post { sv.fullScroll(android.view.View.FOCUS_DOWN) }
+                } catch (e: Exception) {
+                    android.util.Log.w("MainActivity", "appendLog failed", e)
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "appendLog outer failed", e)
+        }
+    }
+
+    private fun appendClickableUri(uri: Uri) {
+        try {
+            val uriStr = uri.toString()
+            val label = "Recording saved: $uriStr\n"
+            val ss = SpannableString(label)
+            val start = label.indexOf(uriStr)
+            if (start >= 0) {
+                val end = start + uriStr.length
+                ss.setSpan(object : ClickableSpan() {
+                    override fun onClick(widget: View) {
+                        try { openUri(uri) } catch (e: Exception) { appendLog("openUri failed: ${e.message}") }
+                    }
+                }, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            runOnUiThread {
+                logView.append(ss)
+                val sv = findViewById<android.widget.ScrollView>(R.id.logScroll)
+                sv.post { sv.fullScroll(android.view.View.FOCUS_DOWN) }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "appendClickableUri failed", e)
+            appendLog("appendClickableUri failed: ${e.message}")
+        }
+    }
+
+    private fun openUri(uri: Uri) {
+        try {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "video/*")
+                flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            appendLog("Failed to open URI: ${e.message}")
+            try { Toast.makeText(this, "ファイルを開けませんでした", Toast.LENGTH_SHORT).show() } catch (_: Exception) {}
+        }
+    }
+
+    private fun clearLog() {
+        try { runOnUiThread { logView.text = "" } } catch (_: Exception) {}
     }
 
     private fun formatMs(ms: Long): String {

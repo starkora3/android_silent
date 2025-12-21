@@ -40,6 +40,7 @@
 
         <activity android:name=".VideoListActivity" android:exported="false" />
         <activity android:name=".PlayerActivity" android:exported="false" />
+        <activity android:name=".SecondActivity" android:exported="false" />
         <service android:name=".RecordingService"
             android:exported="false"
             android:foregroundServiceType="camera|microphone"

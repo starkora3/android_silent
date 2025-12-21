@@ -43,6 +43,8 @@ class RecordingService : Service(), LifecycleOwner {
         const val ACTION_RECORDING_STOPPED = "com.example.silent.action.RECORDING_STOPPED"
         const val CHANNEL_ID = "recording_channel"
         const val NOTIF_ID = 1001
+        // New: notify Activity that CAMERA permission is required
+        const val ACTION_CAMERA_PERMISSION_REQUIRED = "com.example.silent.action.CAMERA_PERMISSION_REQUIRED"
     }
 
     private var cameraProvider: ProcessCameraProvider? = null
@@ -104,10 +106,20 @@ class RecordingService : Service(), LifecycleOwner {
                     startForeground(NOTIF_ID, buildNotification("録画を開始しています"))
                 } catch (se: SecurityException) {
                     Log.e("RecordingService", "startForeground failed due to missing notification or foreground permission", se)
-                    // Notify Activity that foreground permission appears to be missing so it can request/guide the user
-                    try { sendBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED)) } catch (e: Exception) { Log.e("RecordingService", "failed to send fgs-permission-required broadcast", e) }
-                    stopSelf()
-                    return START_NOT_STICKY
+                    // Determine likely missing permission and notify Activity accordingly.
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                            // On Android 13+, missing POST_NOTIFICATIONS will cause startForeground to fail; ask Activity to request notification permission
+                            sendBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED))
+                        } else {
+                            // Otherwise, inform Activity that FOREGROUND_SERVICE permission may be required (some ROMs enforce additional checks)
+                            sendBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED))
+                        }
+                    } catch (e: Exception) {
+                        Log.e("RecordingService", "failed to send permission-required broadcast", e)
+                    }
+                     stopSelf()
+                     return START_NOT_STICKY
                 } catch (re: Exception) {
                     Log.e("RecordingService", "startForeground failed with exception", re)
                     try { sendBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast", e) }
@@ -174,7 +186,8 @@ class RecordingService : Service(), LifecycleOwner {
         // permission checks: ensure CAMERA permission is granted before attempting to use CameraX
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             Log.e("RecordingService", "startRecording: CAMERA permission not granted")
-            try { sendBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)) } catch (_: Exception) {}
+            // Notify Activity that camera permission is required so it can request permissions
+            try { sendBroadcast(Intent(ACTION_CAMERA_PERMISSION_REQUIRED)) } catch (_: Exception) {}
             stopSelf()
             return
         }

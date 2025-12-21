@@ -27,28 +27,69 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <Button
-        android:id="@+id/btnViewList"
+    <!-- ログ表示用領域: audioStatus の下、btnViewList の上に配置される ScrollView -->
+    <ScrollView
+        android:id="@+id/logScroll"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:fillViewport="true"
+        android:background="#80000000"
+        android:padding="6dp"
+        app:layout_constraintTop_toBottomOf="@id/audioStatus"
+        app:layout_constraintBottom_toTopOf="@id/btnContainer"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <TextView
+            android:id="@+id/logView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@android:color/white"
+            android:textSize="12sp"
+            android:lineSpacingExtra="2dp"
+            android:text="ログはここに表示されます\n" />
+    </ScrollView>
+
+    <!-- 既存の btnViewList を 2 つのボタンを持つコンテナに置き換え -->
+    <LinearLayout
+        android:id="@+id/btnContainer"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/view_list"
+        android:orientation="horizontal"
+        android:gravity="center"
         app:layout_constraintBottom_toTopOf="@id/recordButton"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        android:layout_marginBottom="8dp" />
+        android:layout_marginBottom="8dp">
+
+        <Button
+            android:id="@+id/btnViewList"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/view_list"
+            android:layout_marginEnd="8dp" />
+
+        <Button
+            android:id="@+id/btnNavigate"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="画面遷移" />
+
+    </LinearLayout>
 
     <TextView
         android:id="@+id/recordingTimer"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="00:00"
-        android:textColor="@android:color/white"
+        android:layout_marginBottom="16dp"
         android:background="#80000000"
         android:padding="6dp"
+        android:text="00:00"
+        android:textColor="@android:color/white"
         app:layout_constraintBottom_toTopOf="@id/recordButton"
-        app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        android:layout_marginBottom="40dp" />
+        app:layout_constraintHorizontal_bias="0.14"
+        app:layout_constraintStart_toStartOf="parent" />
 
     <Button
         android:id="@+id/recordButton"

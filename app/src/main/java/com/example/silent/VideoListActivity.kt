@@ -21,6 +21,7 @@ import android.widget.FrameLayout
 import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import android.widget.Button
 
 class VideoListActivity : AppCompatActivity() {
 
@@ -82,6 +83,17 @@ class VideoListActivity : AppCompatActivity() {
                 confirmDelete(item)
             })
             recycler.adapter = adapter
+
+            // 追加: メインへ戻るボタンの動作
+            try {
+                val btnBack = findViewById<Button>(R.id.btnBackToMain)
+                btnBack.setOnClickListener {
+                    // 単純に finish して前の Activity に戻る
+                    finish()
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("VideoListActivity", "Back button setup failed", e)
+            }
 
             // Apply WindowInsets to avoid status bar overlap
             ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
