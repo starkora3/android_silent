@@ -304,11 +304,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Receiver to detect when Service.onStartCommand is entered (diagnostic for devices where logcat may filter INFO)
+    private val serviceOnStartReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.getStringExtra("action")
+            appendLog("Service.onStartCommand called (action=$action)")
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         // bind to service if running
         val intent = Intent(this, RecordingService::class.java)
-        bindService(intent, serviceConnection, 0)
+        // Ensure bind will create the connection if the service is not yet running
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
 
         // register receiver for recording state changes
         val stateFilter = IntentFilter().apply {
@@ -332,6 +341,10 @@ class MainActivity : AppCompatActivity() {
         // register receiver for camera-permission-required broadcasts
         val camFilter = IntentFilter(RecordingService.ACTION_CAMERA_PERMISSION_REQUIRED)
         try { registerReceiver(cameraPermReceiver, camFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver camera failed", e) }
+
+        // register receiver for diagnostic onStartCommand broadcast
+        try { registerReceiver(serviceOnStartReceiver, IntentFilter("com.example.silent.action.SERVICE_ONSTARTCALLED"), Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver onStartCalled failed", e) }
+
         appendLog("onStart: receivers registered and service bind attempted")
     }
 
@@ -346,6 +359,7 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(recordingStateReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(fgsPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(cameraPermReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(serviceOnStartReceiver) } catch (_: Exception) {}
         appendLog("onStop: unbound and receivers unregistered")
     }
 
@@ -552,27 +566,13 @@ class MainActivity : AppCompatActivity() {
         // Start foreground recording service (robust attempt)
         val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_START }
         try {
-            try {
-                try {
-                    startService(intent)
-                    appendLog("startService called")
-                } catch (e: IllegalStateException) {
-                    android.util.Log.w("MainActivity", "startService threw IllegalStateException, trying startForegroundService", e)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(intent)
-                        appendLog("startForegroundService used after IllegalStateException")
-                    } else {
-                        throw e
-                    }
-                }
-            } catch (inner: Exception) {
-                android.util.Log.w("MainActivity", "service start failed, attempting fallback", inner)
-                try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
-                    appendLog("Fallback service start attempted")
-                } catch (inner2: Exception) {
-                    throw RuntimeException("All service start attempts failed", inner2)
-                }
+            // On Android O+ we must use startForegroundService when the service will call startForeground
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+                appendLog("startForegroundService called")
+            } else {
+                startService(intent)
+                appendLog("startService called")
             }
 
             // Do NOT change the button text here. The service will broadcast ACTION_RECORDING_STARTED
@@ -590,7 +590,7 @@ class MainActivity : AppCompatActivity() {
             appendLog("Failed to start recording service: ${e.message}")
             try {
                 val parent = findViewById<View>(android.R.id.content)
-                val s = Snackbar.make(parent, "録画サービスを開始できませんでした。設定で権限を確認してください", Snackbar.LENGTH_INDEFINITE)
+                val s = Snackbar.make(parent, "録画サービスを起動できませんでした。設定で権限を確認してください", Snackbar.LENGTH_INDEFINITE)
                     .setAction("設定") {
                         try {
                             startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) })

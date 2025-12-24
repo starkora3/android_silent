@@ -34,7 +34,7 @@
         android:layout_height="0dp"
         android:fillViewport="true"
         android:background="#80000000"
-        android:padding="6dp"
+        android:padding="12dp"
         app:layout_constraintTop_toBottomOf="@id/audioStatus"
         app:layout_constraintBottom_toTopOf="@id/btnContainer"
         app:layout_constraintStart_toStartOf="parent"

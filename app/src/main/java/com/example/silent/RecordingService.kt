@@ -94,8 +94,17 @@ class RecordingService : Service(), LifecycleOwner {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
+        // Use WARN to increase chance the log is visible on devices with info-level filtering
+        Log.w("RecordingService", "onStartCommand received intent action=${intent?.action}")
+        // Also notify Activity for immediate UI visibility that onStartCommand was entered
+        try {
+            val b = Intent("com.example.silent.action.SERVICE_ONSTARTCALLED").apply { putExtra("action", intent?.action) }
+            sendBroadcast(b)
+        } catch (e: Exception) {
+            Log.w("RecordingService", "failed to send onStartCalled broadcast", e)
+        }
+         when (intent?.action) {
+             ACTION_START -> {
                 // Removed incorrect runtime permission check for FOREGROUND_SERVICE
                 // and removed the pre-check that aborted start when POST_NOTIFICATIONS
                 // was not yet granted. Instead we always attempt to enter foreground
@@ -123,6 +132,12 @@ class RecordingService : Service(), LifecycleOwner {
                 } catch (re: Exception) {
                     Log.e("RecordingService", "startForeground failed with exception", re)
                     try { sendBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast", e) }
+                    // include exception message in a broadcast for better debug on problematic Android builds
+                    try {
+                        val b = Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
+                        b.putExtra("error", re.message)
+                        sendBroadcast(b)
+                    } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast with error detail", e) }
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -150,9 +165,9 @@ class RecordingService : Service(), LifecycleOwner {
                 try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
                 stopSelf()
             }
-        }
-        return START_STICKY
-    }
+         }
+         return START_STICKY
+     }
 
     private fun setupVideoCapture() {
         val recorder = Recorder.Builder()
@@ -269,6 +284,12 @@ class RecordingService : Service(), LifecycleOwner {
 
         } catch (e: Exception) {
             Log.e("RecordingService", "Exception during prepare/start recording", e)
+            // for better diagnostics on Android 15, include the stacktrace in a broadcast the Activity can surface
+            try {
+                val b = Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
+                b.putExtra("error", e.message)
+                sendBroadcast(b)
+            } catch (_: Exception) {}
             Toast.makeText(this, "録画の開始に失敗しました: ${e.message}", Toast.LENGTH_LONG).show()
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
             stopSelf()

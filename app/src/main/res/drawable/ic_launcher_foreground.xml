@@ -3,13 +3,12 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- S文字（白） -->
+    <!-- Filled S character in accent color -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M36,30 C36,30 60,18 72,30 C84,42 60,54 48,60 C36,66 30,78 42,84 C54,90 78,78 78,66"
-        android:strokeWidth="6"
-        android:strokeColor="#FFFFFF"
+        android:fillColor="#FF6200EE"
+        android:pathData="M30,24 C30,24 60,12 72,24 C84,36 60,48 48,54 C36,60 30,72 42,78 C54,84 78,72 78,60"
+        android:strokeWidth="4"
+        android:strokeColor="#FF3700B3"
         android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:fillAlpha="0" />
+        android:strokeLineJoin="round" />
 </vector>
