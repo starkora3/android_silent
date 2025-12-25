@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
@@ -27,7 +28,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- ログ表示用領域: audioStatus の下、btnViewList の上に配置される ScrollView -->
+    <!-- ログ表示用領域: audioStatus の下、btnContainer の上に配置される ScrollView -->
     <ScrollView
         android:id="@+id/logScroll"
         android:layout_width="0dp"
@@ -51,55 +52,102 @@
     </ScrollView>
 
     <!-- 既存の btnViewList を 2 つのボタンを持つコンテナに置き換え -->
+
+    <!-- 画面下部のコントロール群: 録画ボタン + タイマー録画コントロール -->
+
     <LinearLayout
         android:id="@+id/btnContainer"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
+        android:layout_marginBottom="8dp"
         android:gravity="center"
-        app:layout_constraintBottom_toTopOf="@id/recordButton"
+        android:orientation="horizontal"
+        app:layout_constraintBottom_toTopOf="@id/bottomControls"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        android:layout_marginBottom="8dp">
+        app:layout_constraintHorizontal_bias="0.697"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <TextView
+            android:id="@+id/recordingTimer"
+            android:layout_width="150dp"
+            android:layout_height="35dp"
+            android:background="#80000000"
+            android:padding="6dp"
+            android:text=""
+            android:textColor="@android:color/white" />
+
+        <TextView
+            android:id="@+id/recordingState"
+            android:layout_width="82dp"
+            android:layout_height="35dp"
+            android:background="#80000000"
+            android:padding="6dp"
+            android:layout_marginLeft="5dp"
+            android:text="00:00"
+            android:textColor="@android:color/white" />
 
         <Button
             android:id="@+id/btnViewList"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/view_list"
-            android:layout_marginEnd="8dp" />
-
-        <Button
-            android:id="@+id/btnNavigate"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="画面遷移" />
+            android:layout_marginLeft="5dp"
+            android:text="@string/view_list" />
 
     </LinearLayout>
 
-    <TextView
-        android:id="@+id/recordingTimer"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="16dp"
-        android:background="#80000000"
-        android:padding="6dp"
-        android:text="00:00"
-        android:textColor="@android:color/white"
-        app:layout_constraintBottom_toTopOf="@id/recordButton"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintHorizontal_bias="0.14"
-        app:layout_constraintStart_toStartOf="parent" />
 
-    <Button
-        android:id="@+id/recordButton"
-        android:layout_width="0dp"
+    <LinearLayout
+        android:id="@+id/bottomControls"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_margin="16dp"
-        android:text="録画開始"
+        android:orientation="vertical"
+        android:padding="8dp"
         app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintHorizontal_bias="0.52"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <Button
+            android:id="@+id/recordButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="録画開始"
+            android:layout_marginBottom="8dp" />
+
+        <LinearLayout
+            android:id="@+id/timerControls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <EditText
+                android:id="@+id/startTimeInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="開始秒 (例:10)"
+                android:inputType="number"
+                android:padding="8dp" />
+
+            <EditText
+                android:id="@+id/durationInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="録画秒数 (例:30)"
+                android:inputType="number"
+                android:padding="8dp"
+                android:layout_marginStart="8dp" />
+
+            <Button
+                android:id="@+id/timerRecordButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="タイマー録画"
+                android:layout_marginStart="8dp" />
+
+        </LinearLayout>
+
+    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

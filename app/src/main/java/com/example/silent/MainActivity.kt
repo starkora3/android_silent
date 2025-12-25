@@ -39,6 +39,10 @@ import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.text.method.LinkMovementMethod
 import android.widget.Toast
+import android.widget.EditText
+import android.text.InputType
+import android.widget.LinearLayout
+import android.view.ViewGroup.LayoutParams
 
 class MainActivity : AppCompatActivity() {
 
@@ -48,8 +52,42 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rootLayout: ViewGroup
     private lateinit var viewListButton: View
     private lateinit var recordingTimer: TextView
+    private lateinit var recordingState: TextView
     private lateinit var logView: TextView
-    private lateinit var navigateButton: View
+
+    // Timer UI elements
+    private var timerStartInput: EditText? = null
+    private var timerDurationInput: EditText? = null
+    private var timerRecordButton: Button? = null
+    // 保存しておいたボタンの元のラベル（元に戻すため）
+    private var timerButtonOriginalText: CharSequence? = null
+
+    // SharedPreferences keys for timer settings
+    private val PREFS_NAME = "silent_prefs"
+    private val KEY_TIMER_START_SEC = "timer_start_sec"
+    private val KEY_TIMER_DURATION_SEC = "timer_duration_sec"
+
+    private fun saveTimerPrefs(startSec: Int, durSec: Int) {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit().putInt(KEY_TIMER_START_SEC, startSec).putInt(KEY_TIMER_DURATION_SEC, durSec).apply()
+            appendLog("Timer prefs saved: start=$startSec, dur=$durSec")
+        } catch (e: Exception) {
+            appendLog("Failed to save timer prefs: ${e.message}")
+        }
+    }
+
+    private fun loadTimerPrefs(): Pair<Int, Int> {
+        return try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val s = prefs.getInt(KEY_TIMER_START_SEC, 0)
+            val d = prefs.getInt(KEY_TIMER_DURATION_SEC, 0)
+            Pair(s, d)
+        } catch (e: Exception) {
+            appendLog("Failed to load timer prefs: ${e.message}")
+            Pair(0, 0)
+        }
+    }
 
     private var videoCapture: VideoCapture<Recorder>? = null
 
@@ -59,10 +97,17 @@ class MainActivity : AppCompatActivity() {
     private val updateRunnable = object : Runnable {
         override fun run() {
             val elapsed = recordingService?.getElapsedMs() ?: 0L
-            recordingTimer.text = formatMs(elapsed)
+            recordingState.text = formatMs(elapsed)
             if (bound && elapsed > 0L) mainHandler.postDelayed(this, 500)
         }
     }
+
+    // Timer state
+    private var timerHandler: Handler = Handler(Looper.getMainLooper())
+    private var timerCountdownRunnable: Runnable? = null
+    private var timerRemainingStartSec = 0
+    private var timerRemainingRecSec = 0
+    private var timerPhase = 0 // 0 = idle, 1 = waiting to start, 2 = recording countdown
 
     private val serviceConnection = object : android.content.ServiceConnection {
         override fun onServiceConnected(name: android.content.ComponentName, serviceIBinder: android.os.IBinder) {
@@ -77,7 +122,7 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.post(updateRunnable)
                 } else {
                     mainHandler.removeCallbacks(updateRunnable)
-                    recordingTimer.text = formatMs(0L)
+                    recordingState.text = formatMs(0L)
                 }
                 appendLog("Service connected. isRecording=$isRec")
             }
@@ -89,7 +134,7 @@ class MainActivity : AppCompatActivity() {
             mainHandler.removeCallbacks(updateRunnable)
             runOnUiThread {
                 recordButton.text = getString(R.string.record_start)
-                recordingTimer.text = formatMs(0L)
+                recordingState.text = formatMs(0L)
                 appendLog("Service disconnected")
             }
         }
@@ -237,7 +282,8 @@ class MainActivity : AppCompatActivity() {
                     RecordingService.ACTION_RECORDING_STOPPED -> {
                         recordButton.text = getString(R.string.record_start)
                         mainHandler.removeCallbacks(updateRunnable)
-                        recordingTimer.text = formatMs(0L)
+                        recordingState.text = formatMs(0L)
+                        recordingTimer.text = ""
                         appendLog("Recording stopped")
                     }
                     RecordingService.ACTION_RECORDING_SAVED -> {
@@ -360,6 +406,10 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(fgsPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(cameraPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(serviceOnStartReceiver) } catch (_: Exception) {}
+
+        // cancel any running timer countdowns to avoid leaks
+        cancelTimerCountdown()
+
         appendLog("onStop: unbound and receivers unregistered")
     }
 
@@ -372,17 +422,77 @@ class MainActivity : AppCompatActivity() {
         audioStatus = findViewById(R.id.audioStatus)
         rootLayout = findViewById(R.id.rootLayout)
         viewListButton = findViewById(R.id.btnViewList)
-        navigateButton = findViewById(R.id.btnNavigate)
         recordingTimer = findViewById(R.id.recordingTimer)
+        recordingState = findViewById(R.id.recordingState)
         logView = findViewById(R.id.logView)
 
-        navigateButton.setOnClickListener {
+        // --- bind timer UI from XML (XML already contains startTimeInput/durationInput/timerRecordButton) ---
+        try {
+            timerStartInput = findViewById(R.id.startTimeInput)
+            timerDurationInput = findViewById(R.id.durationInput)
+            timerRecordButton = findViewById(R.id.timerRecordButton)
+
+            // Save original label so we can restore it when timer completes/cancels
+            timerButtonOriginalText = timerRecordButton?.text
+
+            // Restore saved timer settings
             try {
-                val intent = Intent(this, SecondActivity::class.java)
-                startActivity(intent)
-            } catch (e: Exception) {
-                appendLog("Failed to navigate: ${e.message}")
+                val (savedStart, savedDur) = loadTimerPrefs()
+                timerStartInput?.setText(savedStart.toString())
+                timerDurationInput?.setText(savedDur.toString())
+            } catch (_: Exception) {}
+
+            timerRecordButton?.setOnClickListener {
+                try {
+                    appendLog("timerRecordButton clicked: phase=$timerPhase, buttonExists=${timerRecordButton != null}")
+                    // If a timer is already running, treat this click as CANCEL
+                    if (timerPhase != 0) {
+                        cancelTimerCountdown()
+                        recordingTimer.text = ""
+                        // restore on UI thread
+                        runOnUiThread { timerRecordButton?.text = timerButtonOriginalText }
+                        appendLog("タイマー録画をキャンセルしました")
+                        return@setOnClickListener
+                    }
+
+                    // Start a new timer: only persist values when user explicitly starts
+                    val startSec = timerStartInput?.text?.toString()?.trim()?.toIntOrNull() ?: 0
+                    val durSec = timerDurationInput?.text?.toString()?.trim()?.toIntOrNull() ?: 0
+                    if (startSec < 0 || durSec <= 0) {
+                        Toast.makeText(this, "正しい秒数を入力してください（開始>=0, 録画時間>0）", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+
+                    // Ensure we remembered original text
+                    if (timerButtonOriginalText == null) timerButtonOriginalText = timerRecordButton?.text
+
+                    // Immediately update button label so UI reflects the started timer (on UI thread)
+                    try {
+                        val before = timerRecordButton?.text
+                        timerRecordButton?.post {
+                            try {
+                                timerRecordButton?.text = "キャンセル"
+                                timerRecordButton?.isEnabled = true
+                                appendLog("タイマー録画ボタン: ラベル変更 before=[$before] after=[${timerRecordButton?.text}]")
+                            } catch (e: Exception) {
+                                appendLog("タイマーボタンラベル変更失敗 (post): ${e.message}")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        appendLog("タイマーボタンラベル変更失敗 outer: ${e.message}")
+                    }
+
+                    // Persist values on explicit start as required
+                    saveTimerPrefs(startSec, durSec)
+
+
+                    startTimerRecording(startSec, durSec)
+                } catch (e: Exception) {
+                    appendLog("タイマー録画の開始に失敗: ${e.message}")
+                }
             }
+        } catch (e: Exception) {
+            appendLog("タイマーUIバインドに失敗: ${e.message}")
         }
 
         // Enable clickable links in the log view so saved URIs can be tapped
@@ -614,6 +724,14 @@ class MainActivity : AppCompatActivity() {
             android.widget.Toast.makeText(this, "録画停止に失敗しました: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
             appendLog("Failed to request stopService: ${e.message}")
         }
+        // Ensure any running timer countdown is cancelled when the user stops recording
+        try {
+            cancelTimerCountdown()
+            recordingTimer.text = ""
+        } catch (e: Exception) {
+            appendLog("Failed to cancel timer on stop: ${e.message}")
+        }
+
         recordButton.text = getString(R.string.record_start)
         updateAudioStatus()
     }
@@ -640,7 +758,7 @@ class MainActivity : AppCompatActivity() {
     private fun appendClickableUri(uri: Uri) {
         try {
             val uriStr = uri.toString()
-            val label = "Recording saved: $uriStr\n"
+            val label = "Recording saved: $uriStr [共有]\n"
             val ss = SpannableString(label)
             val start = label.indexOf(uriStr)
             if (start >= 0) {
@@ -650,6 +768,17 @@ class MainActivity : AppCompatActivity() {
                         try { openUri(uri) } catch (e: Exception) { appendLog("openUri failed: ${e.message}") }
                     }
                 }, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+
+                val shareLabel = "[共有]"
+                val shareStart = label.indexOf(shareLabel, end)
+                if (shareStart >= 0) {
+                    val shareEnd = shareStart + shareLabel.length
+                    ss.setSpan(object : ClickableSpan() {
+                        override fun onClick(widget: View) {
+                            try { shareUri(uri) } catch (e: Exception) { appendLog("shareUri failed: ${e.message}") }
+                        }
+                    }, shareStart, shareEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
             }
             runOnUiThread {
                 logView.append(ss)
@@ -659,6 +788,19 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             android.util.Log.w("MainActivity", "appendClickableUri failed", e)
             appendLog("appendClickableUri failed: ${e.message}")
+        }
+    }
+
+    private fun shareUri(uri: Uri) {
+        try {
+            val share = Intent(Intent.ACTION_SEND).apply {
+                type = "video/*"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(Intent.createChooser(share, "共有"))
+        } catch (e: Exception) {
+            appendLog("Failed to share URI: ${e.message}")
         }
     }
 
@@ -685,5 +827,84 @@ class MainActivity : AppCompatActivity() {
         val minutes = (totalSeconds % 3600) / 60
         val seconds = totalSeconds % 60
         return if (hours > 0) String.format("%d:%02d:%02d", hours, minutes, seconds) else String.format("%02d:%02d", minutes, seconds)
+    }
+
+    // Timer recording support
+    private fun startTimerRecording(startSeconds: Int, durationSeconds: Int) {
+        // cancel any existing timer
+        cancelTimerCountdown()
+        timerRemainingStartSec = startSeconds
+        timerRemainingRecSec = durationSeconds
+        if (startSeconds > 0) {
+            timerPhase = 1
+            appendLog("タイマー録画: 開始まで ${startSeconds}s, 録画時間 ${durationSeconds}s")
+            startStartCountdown()
+        } else {
+            // start immediately
+            appendLog("タイマー録画: すぐに録画開始 (${durationSeconds}s)")
+            mainHandler.postDelayed({ startRecordingInternal() }, 50)
+            // after a short delay, start duration countdown
+            timerPhase = 2
+            startRecCountdown()
+        }
+    }
+
+    private fun startStartCountdown() {
+        timerCountdownRunnable = object : Runnable {
+            override fun run() {
+                try {
+                    if (timerRemainingStartSec <= 0) {
+                        appendLog("タイマー: 録画開始")
+                        mainHandler.postDelayed({ startRecordingInternal() }, 50)
+                        timerPhase = 2
+                        startRecCountdown()
+                        return
+                    }
+                    // update UI
+                    recordingTimer.text = String.format("開始まで: %02d:%02d", timerRemainingStartSec / 60, timerRemainingStartSec % 60)
+                    timerRemainingStartSec -= 1
+                    timerHandler.postDelayed(this, 1000)
+                } catch (e: Exception) {
+                    appendLog("startStartCountdown error: ${e.message}")
+                }
+            }
+        }
+        timerHandler.post(timerCountdownRunnable!!)
+    }
+
+    private fun startRecCountdown() {
+        timerCountdownRunnable = object : Runnable {
+            override fun run() {
+                try {
+                    if (timerRemainingRecSec <= 0) {
+                        appendLog("タイマー: 録画停止")
+                        stopRecording()
+                        recordingState.text = ""
+                        timerPhase = 0
+                        // restore timer button label when recording completes by timer
+                        timerRecordButton?.text = timerButtonOriginalText
+                        return
+                    }
+                    recordingTimer.text = String.format("残り: %02d:%02d", timerRemainingRecSec / 60, timerRemainingRecSec % 60)
+                    timerRemainingRecSec -= 1
+                    timerHandler.postDelayed(this, 1000)
+                } catch (e: Exception) {
+                    appendLog("startRecCountdown error: ${e.message}")
+                }
+            }
+        }
+        timerHandler.post(timerCountdownRunnable!!)
+    }
+
+    private fun cancelTimerCountdown() {
+        try {
+            timerCountdownRunnable?.let { timerHandler.removeCallbacks(it) }
+        } catch (e: Exception) {
+            // ignore
+        }
+        timerCountdownRunnable = null
+        timerPhase = 0
+        // restore button label when timer is cancelled
+        try { timerRecordButton?.text = timerButtonOriginalText } catch (e: Exception) { /* ignore */ }
     }
 }
