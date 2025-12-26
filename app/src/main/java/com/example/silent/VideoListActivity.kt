@@ -13,15 +13,13 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.snackbar.Snackbar
-import android.os.Handler
-import android.os.Looper
-import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
 import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import android.widget.Button
+import android.view.Gravity
 
 class VideoListActivity : AppCompatActivity() {
 
@@ -33,7 +31,9 @@ class VideoListActivity : AppCompatActivity() {
             intent ?: return
             if (intent.action == RecordingService.ACTION_RECORDING_SAVED) {
                 val uriStr = intent.getStringExtra("video_uri")
+                // Guard: only update UI if Activity is not finishing/destroyed
                 runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
                     // refresh list
                     loadVideos()
                     uriStr?.let { _ ->
@@ -48,7 +48,7 @@ class VideoListActivity : AppCompatActivity() {
         super.onStart()
         // Register receiver defensively to avoid crashing if registration fails on some devices
         try {
-            // Use non-exported registration on newer platforms to avoid security/permission issues
+            // Always register as non-exported so only our app receives these broadcasts
             registerReceiver(recordingSavedReceiver, IntentFilter(RecordingService.ACTION_RECORDING_SAVED), Context.RECEIVER_NOT_EXPORTED)
         } catch (e: Exception) {
             android.util.Log.w("VideoListActivity", "registerReceiver failed", e)

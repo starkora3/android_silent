@@ -371,25 +371,35 @@ class MainActivity : AppCompatActivity() {
             addAction(RecordingService.ACTION_RECORDING_STOPPED)
             addAction(RecordingService.ACTION_RECORDING_SAVED) // added: receive saved URI broadcasts
         }
-        try { registerReceiver(recordingStateReceiver, stateFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver state failed", e) }
-
-        // register receiver for notification-permission-required broadcasts
-        val filter = IntentFilter(RecordingService.ACTION_NOTIFICATION_PERMISSION_REQUIRED)
         try {
-            registerReceiver(notifPermReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } catch (e: Exception) {
-            android.util.Log.w("MainActivity", "registerReceiver failed", e)
+            safeRegisterReceiver(recordingStateReceiver, stateFilter)
+        } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver state failed", e) }
+
+        // register receiver for timer broadcasts from service
+        val timerFilter = IntentFilter().apply {
+            addAction(RecordingService.ACTION_TIMER_TICK)
+            addAction(RecordingService.ACTION_TIMER_STARTED)
+            addAction(RecordingService.ACTION_TIMER_CANCELLED)
         }
+        try { safeRegisterReceiver(timerReceiver, timerFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver timer failed", e) }
+
+         // register receiver for notification-permission-required broadcasts
+         val filter = IntentFilter(RecordingService.ACTION_NOTIFICATION_PERMISSION_REQUIRED)
+         try {
+             safeRegisterReceiver(notifPermReceiver, filter)
+         } catch (e: Exception) {
+             android.util.Log.w("MainActivity", "registerReceiver failed", e)
+         }
 
         // register receiver for foreground-permission-required broadcasts
         val fgsFilter = IntentFilter(RecordingService.ACTION_FOREGROUND_PERMISSION_REQUIRED)
-        try { registerReceiver(fgsPermReceiver, fgsFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver fgs failed", e) }
+        try { safeRegisterReceiver(fgsPermReceiver, fgsFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver fgs failed", e) }
         // register receiver for camera-permission-required broadcasts
         val camFilter = IntentFilter(RecordingService.ACTION_CAMERA_PERMISSION_REQUIRED)
-        try { registerReceiver(cameraPermReceiver, camFilter, Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver camera failed", e) }
+        try { safeRegisterReceiver(cameraPermReceiver, camFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver camera failed", e) }
 
         // register receiver for diagnostic onStartCommand broadcast
-        try { registerReceiver(serviceOnStartReceiver, IntentFilter("com.example.silent.action.SERVICE_ONSTARTCALLED"), Context.RECEIVER_NOT_EXPORTED) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver onStartCalled failed", e) }
+        try { safeRegisterReceiver(serviceOnStartReceiver, IntentFilter("com.example.silent.action.SERVICE_ONSTARTCALLED")) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver onStartCalled failed", e) }
 
         appendLog("onStart: receivers registered and service bind attempted")
     }
@@ -403,6 +413,7 @@ class MainActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(updateRunnable)
         try { unregisterReceiver(notifPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(recordingStateReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(timerReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(fgsPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(cameraPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(serviceOnStartReceiver) } catch (_: Exception) {}
@@ -831,21 +842,19 @@ class MainActivity : AppCompatActivity() {
 
     // Timer recording support
     private fun startTimerRecording(startSeconds: Int, durationSeconds: Int) {
-        // cancel any existing timer
-        cancelTimerCountdown()
-        timerRemainingStartSec = startSeconds
-        timerRemainingRecSec = durationSeconds
-        if (startSeconds > 0) {
-            timerPhase = 1
-            appendLog("タイマー録画: 開始まで ${startSeconds}s, 録画時間 ${durationSeconds}s")
-            startStartCountdown()
-        } else {
-            // start immediately
-            appendLog("タイマー録画: すぐに録画開始 (${durationSeconds}s)")
-            mainHandler.postDelayed({ startRecordingInternal() }, 50)
-            // after a short delay, start duration countdown
-            timerPhase = 2
-            startRecCountdown()
+        // Delegate timer control to the RecordingService so it continues when Activity is backgrounded.
+        try {
+            cancelTimerCountdown() // local UI cleanup
+            val intent = Intent(this, RecordingService::class.java).apply {
+                action = RecordingService.ACTION_TIMER_START
+                putExtra("start_sec", startSeconds)
+                putExtra("duration_sec", durationSeconds)
+            }
+            // Ensure service is started; on newer Android versions use startForegroundService when appropriate
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+            appendLog("ACTION_TIMER_START sent start=$startSeconds dur=$durationSeconds")
+        } catch (e: Exception) {
+            appendLog("Failed to send ACTION_TIMER_START: ${e.message}")
         }
     }
 
@@ -897,6 +906,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cancelTimerCountdown() {
+        // Cancel local UI countdown and inform service to cancel timer if running there
         try {
             timerCountdownRunnable?.let { timerHandler.removeCallbacks(it) }
         } catch (e: Exception) {
@@ -906,5 +916,69 @@ class MainActivity : AppCompatActivity() {
         timerPhase = 0
         // restore button label when timer is cancelled
         try { timerRecordButton?.text = timerButtonOriginalText } catch (e: Exception) { /* ignore */ }
+        try {
+            val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_TIMER_CANCEL }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+            appendLog("ACTION_TIMER_CANCEL sent")
+        } catch (e: Exception) {
+            appendLog("Failed to send ACTION_TIMER_CANCEL: ${e.message}")
+        }
+    }
+
+    // Receiver for timer events from the service
+    private val timerReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            runOnUiThread {
+                when (intent?.action) {
+                    RecordingService.ACTION_TIMER_TICK -> {
+                        // Update countdown UI based on phase
+                        val remainingSec = intent.getIntExtra("remaining_sec", 0)
+                        val phase = intent.getStringExtra("phase") ?: ""
+                        when (phase) {
+                            "waiting" -> {
+                                timerPhase = 1
+                                recordingTimer.text = String.format("開始まで: %02d:%02d", remainingSec / 60, remainingSec % 60)
+                            }
+                            "recording" -> {
+                                timerPhase = 2
+                                recordingTimer.text = String.format("残り: %02d:%02d", remainingSec / 60, remainingSec % 60)
+                            }
+                            else -> {
+                                recordingTimer.text = String.format("残り: %02d:%02d", remainingSec / 60, remainingSec % 60)
+                            }
+                        }
+                    }
+                    RecordingService.ACTION_TIMER_STARTED -> {
+                        // Timer started, update phase and UI (recording started)
+                        timerPhase = 2
+                        recordButton.text = getString(R.string.record_stop)
+                        mainHandler.post(updateRunnable)
+                        appendLog("タイマー録画: 録画開始")
+                    }
+                    RecordingService.ACTION_TIMER_CANCELLED -> {
+                        // Timer cancelled, reset UI
+                        recordingTimer.text = ""
+                        timerPhase = 0
+                        // restore button label when timer is cancelled
+                        try { timerRecordButton?.text = timerButtonOriginalText } catch (e: Exception) { /* ignore */ }
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper to register receivers safely without referencing API-33-only flags on older devices
+    private fun safeRegisterReceiver(receiver: BroadcastReceiver, filter: IntentFilter) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // use non-exported registration on newer platforms to avoid security/permission issues
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+        } catch (e: Exception) {
+            // Fallback: log the error so callers can handle silently
+            appendLog("safeRegisterReceiver failed: ${e.message}")
+        }
     }
 }
