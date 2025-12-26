@@ -40,6 +40,8 @@ class RecordingService : Service(), LifecycleOwner {
         const val ACTION_NOTIFICATION_PERMISSION_REQUIRED = "com.example.silent.action.NOTIF_PERMISSION_REQUIRED"
         // New: notify Activity that FOREGROUND_SERVICE permission appears to be missing
         const val ACTION_FOREGROUND_PERMISSION_REQUIRED = "com.example.silent.action.FOREGROUND_PERMISSION_REQUIRED"
+        // New: notify Activity that microphone-specific foreground permission is required on Android 15+
+        const val ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED = "com.example.silent.action.FOREGROUND_MIC_PERMISSION_REQUIRED"
         // Broadcasts to notify UI of recording state changes
         const val ACTION_RECORDING_STARTED = "com.example.silent.action.RECORDING_STARTED"
         const val ACTION_RECORDING_STOPPED = "com.example.silent.action.RECORDING_STOPPED"
@@ -79,6 +81,10 @@ class RecordingService : Service(), LifecycleOwner {
     // startForegroundService() was used to start the service.
     private var isForegroundStarted = false
 
+    // Track whether we've already informed the Activity about missing permissions to avoid loops
+    private var notifPermissionBroadcastSent = false
+    private var fgsPermissionBroadcastSent = false
+
     inner class LocalBinder : Binder() {
         fun getService(): RecordingService = this@RecordingService
     }
@@ -106,17 +112,31 @@ class RecordingService : Service(), LifecycleOwner {
         } catch (se: SecurityException) {
             Log.e("RecordingService", "startForeground in onCreate failed due to missing notification/foreground permission", se)
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                    sendLocalBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED))
-                } else {
-                    sendLocalBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED))
-                }
+                // If running on Android 15+ the missing permission may be the microphone FGS permission
+                if (Build.VERSION.SDK_INT >= 35 && ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
+                    sendPermissionBroadcastOnce(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
+                } else
+                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                     sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
+                 } else {
+                     sendPermissionBroadcastOnce(ACTION_FOREGROUND_PERMISSION_REQUIRED)
+                 }
             } catch (e: Exception) {
                 Log.e("RecordingService", "failed to send permission-required broadcast from onCreate", e)
             }
-            // Do not stop the service here; we'll allow callers to handle permission flow.
+            // Ensure we don't keep the service running without having entered foreground; stop to avoid ANR
+            try {
+                stopSelf()
+                Log.i("RecordingService", "Stopped service after failed startForeground in onCreate to avoid ANR")
+            } catch (e: Exception) {
+                Log.e("RecordingService", "stopSelf failed after startForeground failure", e)
+            }
+            return
         } catch (e: Exception) {
             Log.e("RecordingService", "startForeground in onCreate failed", e)
+            // If startForeground failed for any other reason, stop service to avoid timing issues
+            try { stopSelf() } catch (ex: Exception) { Log.e("RecordingService", "stopSelf failed after startForeground exception", ex) }
+            return
         }
 
         // Initialize camera provider asynchronously but RUN binding on the main thread
@@ -162,19 +182,22 @@ class RecordingService : Service(), LifecycleOwner {
                  } catch (se: SecurityException) {
                      Log.e("RecordingService", "startForeground failed due to missing notification or foreground permission (timer)", se)
                      try {
-                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                             sendLocalBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED))
+                         if (Build.VERSION.SDK_INT >= 35 && ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
+                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
+                         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                             sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
                          } else {
-                             sendLocalBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED))
+                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_PERMISSION_REQUIRED)
                          }
                      } catch (e: Exception) {
                          Log.e("RecordingService", "failed to send permission-required broadcast (timer)", e)
                      }
+                     // Stop service to avoid ANR if we couldn't enter foreground
                      stopSelf()
                      return START_NOT_STICKY
                  } catch (re: Exception) {
                      Log.e("RecordingService", "startForeground failed (timer) with exception", re)
-                     try { sendLocalBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast (timer)", e) }
+                     try { sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast (timer)", e) }
                      stopSelf()
                      return START_NOT_STICKY
                  }
@@ -205,28 +228,38 @@ class RecordingService : Service(), LifecycleOwner {
                     Log.e("RecordingService", "startForeground failed due to missing notification or foreground permission", se)
                     // Determine likely missing permission and notify Activity accordingly.
                     try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                            // On Android 13+, missing POST_NOTIFICATIONS will cause startForeground to fail; ask Activity to request notification permission
-                            sendLocalBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED))
-                        } else {
-                            // Otherwise, inform Activity that FOREGROUND_SERVICE permission may be required (some ROMs enforce additional checks)
-                            sendLocalBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED))
-                        }
+                         if (Build.VERSION.SDK_INT >= 35 && ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
+                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
+                         } else
+                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                             // On Android 13+, missing POST_NOTIFICATIONS will cause startForeground to fail; ask Activity to request notification permission
+                             sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
+                         } else {
+                             // Otherwise, inform Activity that FOREGROUND_SERVICE permission may be required (some ROMs enforce additional checks)
+                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_PERMISSION_REQUIRED)
+                         }
                     } catch (e: Exception) {
                         Log.e("RecordingService", "failed to send permission-required broadcast", e)
                     }
-                     stopSelf()
+                     // Stop the service to avoid ForegroundServiceDidNotStartInTimeException
+                     try {
+                         stopSelf()
+                         Log.i("RecordingService", "Stopped service after failed startForeground in ACTION_START to avoid ANR")
+                     } catch (e: Exception) {
+                         Log.e("RecordingService", "stopSelf failed after startForeground failure in ACTION_START", e)
+                     }
                      return START_NOT_STICKY
                 } catch (re: Exception) {
                     Log.e("RecordingService", "startForeground failed with exception", re)
-                    try { sendLocalBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast", e) }
+                    try { sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast", e) }
                     // include exception message in a broadcast for better debug on problematic Android builds
                     try {
                         val b = Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
                         b.putExtra("error", re.message)
                         sendLocalBroadcast(b)
                     } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast with error detail", e) }
-                    stopSelf()
+                    // Stop service to avoid ANR
+                    try { stopSelf() } catch (ex: Exception) { Log.e("RecordingService", "stopSelf failed after startForeground exception in ACTION_START", ex) }
                     return START_NOT_STICKY
                 }
 
@@ -586,6 +619,55 @@ class RecordingService : Service(), LifecycleOwner {
             sendBroadcast(intent)
         } catch (e: Exception) {
             Log.w("RecordingService", "sendLocalBroadcast failed", e)
+        }
+    }
+
+    // Helper to send permission-required broadcast at most once per service instance
+    private fun sendPermissionBroadcastOnce(action: String, extras: Intent.() -> Unit = {}) {
+        try {
+            when (action) {
+                ACTION_NOTIFICATION_PERMISSION_REQUIRED -> {
+                    if (!notifPermissionBroadcastSent) {
+                        val i = Intent(action)
+                        i.extras()
+                        sendLocalBroadcast(i)
+                        notifPermissionBroadcastSent = true
+                        Log.i("RecordingService", "Sent ACTION_NOTIFICATION_PERMISSION_REQUIRED (once)")
+                    } else {
+                        Log.i("RecordingService", "Skipped duplicate ACTION_NOTIFICATION_PERMISSION_REQUIRED")
+                    }
+                }
+                ACTION_FOREGROUND_PERMISSION_REQUIRED -> {
+                    if (!fgsPermissionBroadcastSent) {
+                        val i = Intent(action)
+                        i.extras()
+                        sendLocalBroadcast(i)
+                        fgsPermissionBroadcastSent = true
+                        Log.i("RecordingService", "Sent ACTION_FOREGROUND_PERMISSION_REQUIRED (once)")
+                    } else {
+                        Log.i("RecordingService", "Skipped duplicate ACTION_FOREGROUND_PERMISSION_REQUIRED")
+                    }
+                }
+                ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED -> {
+                    if (!fgsPermissionBroadcastSent) {
+                        val i = Intent(action)
+                        i.extras()
+                        sendLocalBroadcast(i)
+                        fgsPermissionBroadcastSent = true
+                        Log.i("RecordingService", "Sent ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED (once)")
+                    } else {
+                        Log.i("RecordingService", "Skipped duplicate ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED")
+                    }
+                }
+                else -> {
+                    // fallback: send directly
+                    val i = Intent(action)
+                    i.extras()
+                    sendLocalBroadcast(i)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("RecordingService", "sendPermissionBroadcastOnce failed", e)
         }
     }
 

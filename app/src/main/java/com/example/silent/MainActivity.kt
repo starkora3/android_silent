@@ -67,6 +67,9 @@ class MainActivity : AppCompatActivity() {
     private val KEY_TIMER_START_SEC = "timer_start_sec"
     private val KEY_TIMER_DURATION_SEC = "timer_duration_sec"
 
+    // Android 15+ required permission for starting a foreground service with microphone type
+    private val MIC_FGS_PERMISSION = "android.permission.FOREGROUND_SERVICE_MICROPHONE"
+
     private fun saveTimerPrefs(startSec: Int, durSec: Int) {
         try {
             val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -148,6 +151,11 @@ class MainActivity : AppCompatActivity() {
         if (granted) startCamera()
     }
 
+    // Shared pending timer start state when permission requests are needed
+    private var pendingTimerStartSec: Int? = null
+    private var pendingTimerDurSec: Int? = null
+    private var pendingTimerRequested = false
+
     // Notification permission launcher (Android 13+)
     private var pendingStartAfterNotifPerm = false // 保留フラグ: ユーザーが録画開始を押して通知許可が必要な場合に true
     private val notifPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -161,8 +169,12 @@ class MainActivity : AppCompatActivity() {
                     startActivity(intent)
                 }
                 .show()
-            // clear pending flag since user denied
+            // clear pending flags since user denied
             pendingStartAfterNotifPerm = false
+            // also clear pending timer request
+            pendingTimerRequested = false
+            pendingTimerStartSec = null
+            pendingTimerDurSec = null
         } else {
             // granted: if there was a pending user intent to start recording, start now
             if (pendingStartAfterNotifPerm) {
@@ -170,6 +182,17 @@ class MainActivity : AppCompatActivity() {
                 // small delay to ensure permission state is settled
                 mainHandler.postDelayed({
                     try { startRecordingInternal() } catch (e: Exception) { android.util.Log.w("MainActivity", "startRecording after notif perm failed", e) }
+                }, 150)
+            }
+            // If there was a pending timer start, start it now
+            if (pendingTimerRequested) {
+                val s = pendingTimerStartSec ?: 0
+                val d = pendingTimerDurSec ?: 0
+                pendingTimerRequested = false
+                pendingTimerStartSec = null
+                pendingTimerDurSec = null
+                mainHandler.postDelayed({
+                    try { startTimerRecording(s, d) } catch (e: Exception) { android.util.Log.w("MainActivity", "startTimer after notif perm failed", e) }
                 }, 150)
             }
         }
@@ -189,10 +212,25 @@ class MainActivity : AppCompatActivity() {
                 }
                 .show()
             pendingStartAfterFgsPerm = false
+            // clear pending timer request
+            pendingTimerRequested = false
+            pendingTimerStartSec = null
+            pendingTimerDurSec = null
         } else {
             if (pendingStartAfterFgsPerm) {
                 pendingStartAfterFgsPerm = false
                 mainHandler.postDelayed({ try { startRecordingInternal() } catch (e: Exception) { android.util.Log.w("MainActivity", "startRecording after fgs perm failed", e) } }, 150)
+            }
+            // If there was a pending timer request, start it now
+            if (pendingTimerRequested) {
+                val s = pendingTimerStartSec ?: 0
+                val d = pendingTimerDurSec ?: 0
+                pendingTimerRequested = false
+                pendingTimerStartSec = null
+                pendingTimerDurSec = null
+                mainHandler.postDelayed({
+                    try { startTimerRecording(s, d) } catch (e: Exception) { android.util.Log.w("MainActivity", "startTimer after fgs perm failed", e) }
+                }, 150)
             }
         }
     }
@@ -200,19 +238,34 @@ class MainActivity : AppCompatActivity() {
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                // show rationale if needed
-                if (shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
-                    android.app.AlertDialog.Builder(this)
-                        .setTitle("通知の許可")
-                        .setMessage("録画中の通知を表示するために通知の許可が必要です。設定しますか？")
-                        .setPositiveButton("許可") { _, _ -> notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }
-                        .setNegativeButton("後で", null)
-                        .show()
-                } else {
-                    // direct request
-                    notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                }
+                // Instead of auto-launching the runtime dialog on startup (which can loop on some ROMs),
+                // show a snackbar asking the user to grant notifications and let them trigger the request.
+                val parent = findViewById<View>(android.R.id.content)
+                val snack = Snackbar.make(parent, "録画通知を表示するには通知の許可が必要です", Snackbar.LENGTH_INDEFINITE)
+                    .setAction("許可") {
+                        // launch the runtime permission request when user explicitly taps
+                        notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
+                snack.show()
             }
+        }
+    }
+
+    // Helper: determine whether a permission is a runtime (dangerous) permission on this device.
+    // Some permissions like FOREGROUND_SERVICE are not runtime on many platforms; requesting them
+    // via the runtime permission API will always fail and can cause confusing loops. We only
+    // attempt a runtime request when the system classifies the permission as dangerous.
+    private fun isRuntimePermission(permission: String): Boolean {
+        return try {
+            val pi = packageManager.getPermissionInfo(permission, 0)
+            val base = android.content.pm.PermissionInfo.PROTECTION_MASK_BASE
+            val prot = pi.protectionLevel and base
+            prot == android.content.pm.PermissionInfo.PROTECTION_DANGEROUS
+        } catch (e: Exception) {
+            // If we can't resolve the permission info, assume it's NOT a runtime permission
+            appendLog("isRuntimePermission: failed to get info for $permission: ${e.message}")
+            false
         }
     }
 
@@ -316,19 +369,22 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 val parent = findViewById<View>(android.R.id.content) ?: return@runOnUiThread
+                // Show guidance to the user but DO NOT automatically call runtime permission request
+                // or set pendingStartAfterFgsPerm here. Some devices/ROMs don't support runtime request
+                // for FOREGROUND_SERVICE and auto-launching causes a loop.
                 val snack = Snackbar.make(parent, "フォアグラウンドサービス実行の権限が必要です。設定を開きますか？", Snackbar.LENGTH_INDEFINITE)
                     .setAction("設定") {
-                        val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) }
-                        startActivity(i)
+                        try {
+                            // Prefer opening the app settings where user can grant the permission if supported.
+                            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) })
+                        } catch (_: Exception) { }
                     }
                 try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
                 snack.show()
                 appendLog("Foreground-service permission required (received broadcast)")
-                // attempt to ask runtime permission if applicable
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    pendingStartAfterFgsPerm = true
-                    try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) { /* some ROMs don't allow runtime request for this; settings guidance above will help */ }
-                }
+                // NOTE: do not call fgsPermissionLauncher.launch(...) or set pendingStartAfterFgsPerm here.
+                // The launcher should only be triggered when the user explicitly tries to start recording
+                // (see existing code in startRecording()). This avoids repeated automatic requests.
             }
         }
     }
@@ -394,6 +450,9 @@ class MainActivity : AppCompatActivity() {
         // register receiver for foreground-permission-required broadcasts
         val fgsFilter = IntentFilter(RecordingService.ACTION_FOREGROUND_PERMISSION_REQUIRED)
         try { safeRegisterReceiver(fgsPermReceiver, fgsFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver fgs failed", e) }
+        // register receiver for microphone-foreground-permission-required broadcasts (Android 15+)
+        val fgsMicFilter = IntentFilter(RecordingService.ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
+        try { safeRegisterReceiver(fgsPermReceiver, fgsMicFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver fgsMic failed", e) }
         // register receiver for camera-permission-required broadcasts
         val camFilter = IntentFilter(RecordingService.ACTION_CAMERA_PERMISSION_REQUIRED)
         try { safeRegisterReceiver(cameraPermReceiver, camFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver camera failed", e) }
@@ -598,6 +657,9 @@ class MainActivity : AppCompatActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.RECORD_AUDIO)
         }
+        // NOTE: Do NOT auto-request the microphone-foreground runtime permission on startup.
+        // Some ROMs/devices will loop or deny it; only request MIC_FGS when the user initiates
+        // a foreground action (handled in startRecording()/startTimerRecording()).
         if (needed.isNotEmpty()) {
             permissionLauncher.launch(needed.toTypedArray())
             appendLog("Requesting permissions: ${needed.joinToString()}")
@@ -622,7 +684,8 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, videoCapture)
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview, videoCapture)
                 appendLog("Camera started and bound to lifecycle")
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -664,22 +727,48 @@ class MainActivity : AppCompatActivity() {
 
         // Ensure FOREGROUND_SERVICE permission on Android 12+ before starting service
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
+            // Only attempt to request FOREGROUND_SERVICE via runtime API if the system actually
+            // classifies it as a runtime (dangerous) permission. On many devices it's a normal
+            // protection level and cannot be requested at runtime; attempting to do so causes
+            // repeated prompts or immediate denial.
+            val shouldRequestFgsRuntime = isRuntimePermission(Manifest.permission.FOREGROUND_SERVICE)
+            if (shouldRequestFgsRuntime && ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
                 // request and remember intent
                 pendingStartAfterFgsPerm = true
                 try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) { /* some ROMs disallow runtime request */ }
 
                 val parent = findViewById<View>(android.R.id.content)
                 val snack = Snackbar.make(parent, "録画の開始にはフォアグラウンドサービス権限が必要です", Snackbar.LENGTH_INDEFINITE)
-                    .setAction("許可") {
-                        try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) {}
-                    }
+                    .setAction("許可") { try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) {} }
                 try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
                 snack.show()
 
                 try { recordButton.isEnabled = true } catch (_: Exception) {}
-                appendLog("Foreground service permission required before starting recording")
+                appendLog("Foreground service permission required before starting recording (runtime request)")
                 return
+            } else if (!shouldRequestFgsRuntime) {
+                // It's not a runtime permission on this device — don't try to request it; rely on
+                // the service to notify the user via UI (and our fgsPermReceiver will show guidance).
+                appendLog("FOREGROUND_SERVICE is not a runtime permission on this device; skipping runtime request")
+            }
+            // For Android 15+, also ensure the microphone-foreground permission is granted before starting
+            if (Build.VERSION.SDK_INT >= 35) {
+                try {
+                    if (ContextCompat.checkSelfPermission(this, MIC_FGS_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+                        pendingStartAfterFgsPerm = true
+                        try { fgsPermissionLauncher.launch(MIC_FGS_PERMISSION) } catch (_: Exception) { /* ignore */ }
+                        val parent = findViewById<View>(android.R.id.content)
+                        val snack = Snackbar.make(parent, "マイクを使うフォアグラウンドサービスの権限が必要です", Snackbar.LENGTH_INDEFINITE)
+                            .setAction("許可") { try { fgsPermissionLauncher.launch(MIC_FGS_PERMISSION) } catch (_: Exception) {} }
+                        try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
+                        snack.show()
+                        try { recordButton.isEnabled = true } catch (_: Exception) {}
+                        appendLog("MIC_FGS_PERMISSION required before starting recording")
+                        return
+                    }
+                } catch (e: Exception) {
+                    appendLog("Failed checking/requesting MIC_FGS_PERMISSION: ${e.message}")
+                }
             }
         }
 
@@ -849,6 +938,76 @@ class MainActivity : AppCompatActivity() {
     private fun startTimerRecording(startSeconds: Int, durationSeconds: Int) {
         // Delegate timer control to the RecordingService so it continues when Activity is backgrounded.
         try {
+            // Check notification permission on Android 13+ before starting a foreground timer service
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    // Save pending timer request so we can resume after permission is granted
+                    pendingTimerRequested = true
+                    pendingTimerStartSec = startSeconds
+                    pendingTimerDurSec = durationSeconds
+                    appendLog("POST_NOTIFICATIONS missing: requesting before starting timer")
+                    // Request permission
+                    notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+
+                    // show explanatory snackbar
+                    val parent = findViewById<View>(android.R.id.content)
+                    val snack = Snackbar.make(parent, "タイマー録画を使用するには通知の許可が必要です", Snackbar.LENGTH_INDEFINITE)
+                        .setAction("許可") { notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
+                    try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
+                    snack.show()
+                    // ensure button re-enabled
+                    try { timerRecordButton?.isEnabled = true } catch (_: Exception) {}
+                    return
+                }
+            }
+
+            // Ensure FOREGROUND_SERVICE permission on Android 12+ before starting service
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val shouldRequestFgsRuntime = isRuntimePermission(Manifest.permission.FOREGROUND_SERVICE)
+                if (shouldRequestFgsRuntime && ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
+                    // Save pending timer and request
+                    pendingTimerRequested = true
+                    pendingTimerStartSec = startSeconds
+                    pendingTimerDurSec = durationSeconds
+                    pendingStartAfterFgsPerm = true
+                    try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) { /* some ROMs disallow runtime request */ }
+
+                    val parent = findViewById<View>(android.R.id.content)
+                    val snack = Snackbar.make(parent, "タイマー録画の開始にはフォアグラウンドサービス権限が必要です", Snackbar.LENGTH_INDEFINITE)
+                        .setAction("許可") { try { fgsPermissionLauncher.launch(Manifest.permission.FOREGROUND_SERVICE) } catch (_: Exception) {} }
+                    try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
+                    snack.show()
+
+                    try { timerRecordButton?.isEnabled = true } catch (_: Exception) {}
+                    appendLog("Foreground service permission required before starting timer (runtime request)")
+                    return
+                } else if (!shouldRequestFgsRuntime) {
+                    appendLog("FOREGROUND_SERVICE is not a runtime permission on this device; skipping runtime request for timer start")
+                }
+                // For Android 15+, ensure microphone foreground permission is present as well
+                if (Build.VERSION.SDK_INT >= 35) {
+                    try {
+                        if (ContextCompat.checkSelfPermission(this, MIC_FGS_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+                            pendingTimerRequested = true
+                            pendingTimerStartSec = startSeconds
+                            pendingTimerDurSec = durationSeconds
+                            pendingStartAfterFgsPerm = true
+                            try { fgsPermissionLauncher.launch(MIC_FGS_PERMISSION) } catch (_: Exception) { /* ignore */ }
+                            val parent = findViewById<View>(android.R.id.content)
+                            val snack = Snackbar.make(parent, "タイマー録画にマイクのフォアグラウンド権限が必要です", Snackbar.LENGTH_INDEFINITE)
+                                .setAction("許可") { try { fgsPermissionLauncher.launch(MIC_FGS_PERMISSION) } catch (_: Exception) {} }
+                            try { val sv = snack.view; val lp = sv.layoutParams; if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; sv.layoutParams = lp } } catch (_: Exception) {}
+                            snack.show()
+                            try { timerRecordButton?.isEnabled = true } catch (_: Exception) {}
+                            appendLog("MIC_FGS_PERMISSION required before starting timer")
+                            return
+                        }
+                    } catch (e: Exception) {
+                        appendLog("Failed checking/requesting MIC_FGS_PERMISSION for timer: ${e.message}")
+                    }
+                }
+            }
+
             cancelTimerCountdown() // local UI cleanup
             val intent = Intent(this, RecordingService::class.java).apply {
                 action = RecordingService.ACTION_TIMER_START
@@ -861,53 +1020,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             appendLog("Failed to send ACTION_TIMER_START: ${e.message}")
         }
-    }
-
-    private fun startStartCountdown() {
-        timerCountdownRunnable = object : Runnable {
-            override fun run() {
-                try {
-                    if (timerRemainingStartSec <= 0) {
-                        appendLog("タイマー: 録画開始")
-                        mainHandler.postDelayed({ startRecordingInternal() }, 50)
-                        timerPhase = 2
-                        startRecCountdown()
-                        return
-                    }
-                    // update UI
-                    recordingTimer.text = String.format("開始まで: %02d:%02d", timerRemainingStartSec / 60, timerRemainingStartSec % 60)
-                    timerRemainingStartSec -= 1
-                    timerHandler.postDelayed(this, 1000)
-                } catch (e: Exception) {
-                    appendLog("startStartCountdown error: ${e.message}")
-                }
-            }
-        }
-        timerHandler.post(timerCountdownRunnable!!)
-    }
-
-    private fun startRecCountdown() {
-        timerCountdownRunnable = object : Runnable {
-            override fun run() {
-                try {
-                    if (timerRemainingRecSec <= 0) {
-                        appendLog("タイマー: 録画停止")
-                        stopRecording()
-                        recordingState.text = ""
-                        timerPhase = 0
-                        // restore timer button label when recording completes by timer
-                        timerRecordButton?.text = timerButtonOriginalText
-                        return
-                    }
-                    recordingTimer.text = String.format("残り: %02d:%02d", timerRemainingRecSec / 60, timerRemainingRecSec % 60)
-                    timerRemainingRecSec -= 1
-                    timerHandler.postDelayed(this, 1000)
-                } catch (e: Exception) {
-                    appendLog("startRecCountdown error: ${e.message}")
-                }
-            }
-        }
-        timerHandler.post(timerCountdownRunnable!!)
     }
 
     private fun cancelTimerCountdown() {
@@ -923,7 +1035,13 @@ class MainActivity : AppCompatActivity() {
         try { timerRecordButton?.text = timerButtonOriginalText } catch (e: Exception) { /* ignore */ }
         try {
             val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_TIMER_CANCEL }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+            // Use startService for cancel to avoid triggering foreground start without explicit user action
+            try {
+                startService(intent)
+            } catch (e: Exception) {
+                // fallback to startForegroundService if startService fails
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) try { startForegroundService(intent) } catch (_: Exception) { appendLog("Failed to request cancel via startForegroundService: ${e.message}") }
+            }
             appendLog("ACTION_TIMER_CANCEL sent")
         } catch (e: Exception) {
             appendLog("Failed to send ACTION_TIMER_CANCEL: ${e.message}")
