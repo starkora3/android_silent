@@ -479,14 +479,19 @@ class MainActivity : AppCompatActivity() {
 
                     // Immediately update button label so UI reflects the started timer (on UI thread)
                     try {
-                        val before = timerRecordButton?.text
-                        timerRecordButton?.post {
+                        // Set local timer phase so subsequent clicks are treated as cancel immediately
+                        timerPhase = 1
+
+                        runOnUiThread {
                             try {
+                                val before = timerRecordButton?.text
                                 timerRecordButton?.text = "キャンセル"
                                 timerRecordButton?.isEnabled = true
+                                // force redraw in case some devices don't update immediately
+                                timerRecordButton?.invalidate()
                                 appendLog("タイマー録画ボタン: ラベル変更 before=[$before] after=[${timerRecordButton?.text}]")
                             } catch (e: Exception) {
-                                appendLog("タイマーボタンラベル変更失敗 (post): ${e.message}")
+                                appendLog("タイマーボタンラベル変更失敗 (runOnUiThread): ${e.message}")
                             }
                         }
                     } catch (e: Exception) {
@@ -938,10 +943,14 @@ class MainActivity : AppCompatActivity() {
                             "waiting" -> {
                                 timerPhase = 1
                                 recordingTimer.text = String.format("開始まで: %02d:%02d", remainingSec / 60, remainingSec % 60)
+                                // Ensure timer button shows 'キャンセル' while waiting (service-driven start)
+                                try { timerRecordButton?.text = "キャンセル" } catch (_: Exception) {}
                             }
                             "recording" -> {
                                 timerPhase = 2
                                 recordingTimer.text = String.format("残り: %02d:%02d", remainingSec / 60, remainingSec % 60)
+                                // when recording starts, restore timer button label
+                                try { timerRecordButton?.text = timerButtonOriginalText } catch (_: Exception) {}
                             }
                             else -> {
                                 recordingTimer.text = String.format("残り: %02d:%02d", remainingSec / 60, remainingSec % 60)
@@ -954,6 +963,8 @@ class MainActivity : AppCompatActivity() {
                         recordButton.text = getString(R.string.record_stop)
                         mainHandler.post(updateRunnable)
                         appendLog("タイマー録画: 録画開始")
+                        // restore timer button label when recording actually starts
+                        try { timerRecordButton?.text = timerButtonOriginalText } catch (_: Exception) {}
                     }
                     RecordingService.ACTION_TIMER_CANCELLED -> {
                         // Timer cancelled, reset UI
