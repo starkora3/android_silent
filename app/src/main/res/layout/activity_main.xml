@@ -152,35 +152,11 @@
                 android:layout_marginStart="8dp" />
 
         </LinearLayout>
-
-        <LinearLayout
-            android:id="@+id/cameraControl"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:background="#aaaaaa"
-            android:gravity="top">
-
-            <TextView
-                android:id="@+id/cameraSelect"
-                android:layout_width="150dp"
-                android:layout_height="35dp"
-                android:background="#80000000"
-                android:padding="6dp"
-                android:text=""
-                android:textColor="@android:color/white" />
-            <Button
-                android:id="@+id/btnCameraSelect"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginLeft="5dp"
-                android:text="カメラ切替" />
-        </LinearLayout>
         <androidx.camera.view.PreviewView
             android:id="@+id/previewView"
             android:layout_width="0dp"
             android:layout_height="0dp"
-            app:layout_constraintTop_toBottomOf="@id/cameraControl"
+            app:layout_constraintTop_toBottomOf="@id/timerControls"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toEndOf="parent" />
     </LinearLayout>

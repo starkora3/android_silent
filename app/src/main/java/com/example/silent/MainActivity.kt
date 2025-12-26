@@ -1,45 +1,48 @@
 package com.example.silent
 
-import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings
-import android.text.SpannableString
-import android.text.Spanned
-import android.text.method.LinkMovementMethod
-import android.text.style.ClickableSpan
-import android.view.Gravity
-import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
 import androidx.camera.video.VideoCapture
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Quality
 import androidx.camera.view.PreviewView
-import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
 import com.google.android.material.snackbar.Snackbar
+import android.view.View
+import android.view.Gravity
+import android.widget.FrameLayout
+import androidx.coordinatorlayout.widget.CoordinatorLayout
+import android.os.Handler
+import android.os.Looper
+import android.Manifest
+import android.content.pm.PackageManager
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ClickableSpan
+import android.text.method.LinkMovementMethod
+import android.widget.Toast
+import android.widget.EditText
+import android.text.InputType
+import android.widget.LinearLayout
+import android.view.ViewGroup.LayoutParams
 
 class MainActivity : AppCompatActivity() {
 
@@ -51,15 +54,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recordingTimer: TextView
     private lateinit var recordingState: TextView
     private lateinit var logView: TextView
-    private lateinit var cameraSelect: TextView
-    private lateinit var btnCameraSelect: Button
-    // Snackbar shown while service is searching for saved video URI
-    private var pendingRecoverySnackbar: com.google.android.material.snackbar.Snackbar? = null
-    // When service reports it's searching for a just-saved recording's URI, block new recording starts
-    private var isRecoveryInProgress: Boolean = false
-
-    // current lens facing (CameraSelector.LENS_FACING_BACK or LENS_FACING_FRONT)
-    private var lensFacing: Int = CameraSelector.LENS_FACING_BACK
 
     // Timer UI elements
     private var timerStartInput: EditText? = null
@@ -105,7 +99,7 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val updateRunnable = object : Runnable {
         override fun run() {
-            val elapsed = (recordingService as? com.example.silent.RecordingService)?.getElapsedMs() ?: 0L
+            val elapsed = recordingService?.getElapsedMs() ?: 0L
             recordingState.text = formatMs(elapsed)
             if (bound && elapsed > 0L) mainHandler.postDelayed(this, 500)
         }
@@ -125,7 +119,7 @@ class MainActivity : AppCompatActivity() {
             bound = true
             // Update UI based on whether the service is currently recording
             runOnUiThread {
-                val isRec = (recordingService as? com.example.silent.RecordingService)?.isRecording() == true
+                val isRec = recordingService?.isRecording() == true
                 recordButton.text = if (isRec) getString(R.string.record_stop) else getString(R.string.record_start)
                 if (isRec) {
                     mainHandler.post(updateRunnable)
@@ -133,21 +127,6 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.removeCallbacks(updateRunnable)
                     recordingState.text = formatMs(0L)
                 }
-                // Sync camera facing UI with service state to avoid mismatch after returning from other screens
-                try {
-                    val serviceFacing = (recordingService as? com.example.silent.RecordingService)?.getCurrentLensFacing()
-                    if (serviceFacing != null) {
-                        lensFacing = serviceFacing
-                        // Ensure preview reflects service state by restarting camera
-                        try {
-                            startCamera()
-                        } catch (e: Exception) {
-                            appendLog("startCamera failed while syncing lensFacing: ${e.message}")
-                        }
-                        updateCameraSelectLabel()
-                        appendLog("Synchronized lensFacing with service: $lensFacing")
-                    }
-                } catch (e: Exception) { appendLog("Failed to sync lensFacing: ${e.message}") }
                 appendLog("Service connected. isRecording=$isRec")
             }
         }
@@ -170,16 +149,6 @@ class MainActivity : AppCompatActivity() {
         val granted = perms[Manifest.permission.CAMERA] == true
         appendLog("Camera permission result: $granted")
         if (granted) startCamera()
-    }
-
-    private fun updateCameraSelectLabel() {
-        try {
-            runOnUiThread {
-                try {
-                    cameraSelect.text = if (lensFacing == CameraSelector.LENS_FACING_BACK) "背面カメラ" else "フロントカメラ"
-                } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
     }
 
     // Shared pending timer start state when permission requests are needed
@@ -373,18 +342,7 @@ class MainActivity : AppCompatActivity() {
                     RecordingService.ACTION_RECORDING_SAVED -> {
                         // Activity receives the saved URI from the service and logs it for user visibility
                         val uriStr = intent?.getStringExtra("video_uri")
-                        val recoveryAttempted = intent?.getBooleanExtra("recovery_attempted", false) ?: false
-                        val recoveryInProgress = intent?.getBooleanExtra("recovery_in_progress", false) ?: false
-                        val errorStr = intent?.getStringExtra("error")
-                        val finalizeEvent = intent?.getStringExtra("finalize_event")
-
-                        // If we had a pending 'searching' snackbar and now received a final URI, dismiss it
                         if (!uriStr.isNullOrEmpty()) {
-                            pendingRecoverySnackbar?.dismiss()
-                            pendingRecoverySnackbar = null
-                            isRecoveryInProgress = false
-                            try { recordButton.isEnabled = true } catch (_: Exception) {}
-                            try { timerRecordButton?.isEnabled = true } catch (_: Exception) {}
                             appendLog("Recording saved: $uriStr")
                             try {
                                 val parent = findViewById<View>(android.R.id.content)
@@ -393,68 +351,12 @@ class MainActivity : AppCompatActivity() {
                                         try { openUri(Uri.parse(uriStr)) } catch (_: Exception) {}
                                     }
                                     .show()
+                                // Add a clickable entry in the log so user can tap the URI
                                 try { appendClickableUri(Uri.parse(uriStr)) } catch (e: Exception) { appendLog("appendClickableUri failed: ${e.message}") }
                             } catch (_: Exception) { }
-                        } else if (errorStr == "ERROR_NO_VALID_DATA") {
-                            // Known CameraX finalize error: notify user that recording had no valid data
-                            pendingRecoverySnackbar?.dismiss()
-                            pendingRecoverySnackbar = null
-                            isRecoveryInProgress = false
-                            try { recordButton.isEnabled = true } catch (_: Exception) {}
-                            try { timerRecordButton?.isEnabled = true } catch (_: Exception) {}
-                            appendLog("Recording finalize error: ERROR_NO_VALID_DATA (finalize_event=${finalizeEvent ?: ""})")
-                            try {
-                                val parent = findViewById<View>(android.R.id.content)
-                                Snackbar.make(parent, "録画データが無効でした（保存されていません）", Snackbar.LENGTH_LONG).show()
-                            } catch (_: Exception) {}
-                        } else if (recoveryInProgress) {
-                            // Service is still trying to recover the saved URI — show a persistent 'searching' UI
-                            appendLog("Recording saved: no URI provided (recovery in progress). finalize_event=${finalizeEvent ?: ""}")
-                            isRecoveryInProgress = true
-                            try { recordButton.isEnabled = false } catch (_: Exception) {}
-                            try { timerRecordButton?.isEnabled = false } catch (_: Exception) {}
-                            try {
-                                val parent = findViewById<View>(android.R.id.content)
-                                // Dismiss previous if any
-                                pendingRecoverySnackbar?.dismiss()
-                                val s = Snackbar.make(parent, "保存先を探索しています… 少しお待ちください", Snackbar.LENGTH_INDEFINITE)
-                                // Offer the user ability to open the video list manually if they prefer
-                                s.setAction("一覧を開く") {
-                                    try { startActivity(Intent(this@MainActivity, VideoListActivity::class.java)) } catch (_: Exception) {}
-                                }
-                                pendingRecoverySnackbar = s
-                                s.show()
-                            } catch (_: Exception) {}
                         } else {
-                            // No URI and not recovering — fallback behavior: inform user and offer to open list
-                            pendingRecoverySnackbar?.dismiss()
-                            pendingRecoverySnackbar = null
-                            isRecoveryInProgress = false
-                            try { recordButton.isEnabled = true } catch (_: Exception) {}
-                            try { timerRecordButton?.isEnabled = true } catch (_: Exception) {}
                             appendLog("Recording saved (no URI provided)")
-                            try {
-                                val parent = findViewById<View>(android.R.id.content)
-                                val msg = if (recoveryAttempted) "録画は保存されましたが、保存先のURIが取得できませんでした。一覧を開きますか？" else "録画は保存されましたが、保存先のURIが提供されませんでした。一覧を開きますか？"
-                                Snackbar.make(parent, msg, Snackbar.LENGTH_INDEFINITE)
-                                    .setAction("一覧を開く") {
-                                        try { startActivity(Intent(this@MainActivity, VideoListActivity::class.java)) } catch (_: Exception) {}
-                                    }
-                                    .show()
-                            } catch (_: Exception) {}
                         }
-                    }
-                    RecordingService.ACTION_CAMERA_SWITCHED -> {
-                        // Service informs us the camera facing changed; update local label to reflect actual state
-                        try {
-                            val facing = intent.getStringExtra("facing") ?: "back"
-                            lensFacing = if (facing == "front") CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-                            updateCameraSelectLabel()
-                            appendLog("Camera switched (broadcast): facing=$facing")
-                            // re-enable camera toggle button after switch completes
-                            try { btnCameraSelect.isEnabled = true } catch (_: Exception) {}
-                            try { pendingRecoverySnackbar?.dismiss() } catch (_: Exception) {}
-                        } catch (e: Exception) { appendLog("Failed handling CAMERA_SWITCHED: ${e.message}") }
                     }
                 }
             }
@@ -524,7 +426,6 @@ class MainActivity : AppCompatActivity() {
             addAction(RecordingService.ACTION_RECORDING_STARTED)
             addAction(RecordingService.ACTION_RECORDING_STOPPED)
             addAction(RecordingService.ACTION_RECORDING_SAVED) // added: receive saved URI broadcasts
-            addAction(RecordingService.ACTION_CAMERA_SWITCHED)
         }
         try {
             safeRegisterReceiver(recordingStateReceiver, stateFilter)
@@ -564,9 +465,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // Dismiss pending recovery snackbar if showing to avoid window leaks
-        try { pendingRecoverySnackbar?.dismiss() } catch (_: Exception) {}
-        pendingRecoverySnackbar = null
         if (bound) {
             try { unbindService(serviceConnection) } catch (e: Exception) { android.util.Log.w("MainActivity", "unbindService failed", e) }
             bound = false
@@ -588,9 +486,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        // Dismiss any stale snackbar (defensive)
-        try { pendingRecoverySnackbar?.dismiss() } catch (_: Exception) {}
-        pendingRecoverySnackbar = null
 
         previewView = findViewById(R.id.previewView)
         recordButton = findViewById(R.id.recordButton)
@@ -600,8 +495,6 @@ class MainActivity : AppCompatActivity() {
         recordingTimer = findViewById(R.id.recordingTimer)
         recordingState = findViewById(R.id.recordingState)
         logView = findViewById(R.id.logView)
-        cameraSelect = findViewById(R.id.cameraSelect)
-        btnCameraSelect = findViewById(R.id.btnCameraSelect)
 
         // --- bind timer UI from XML (XML already contains startTimeInput/durationInput/timerRecordButton) ---
         try {
@@ -677,42 +570,6 @@ class MainActivity : AppCompatActivity() {
             appendLog("タイマーUIバインドに失敗: ${e.message}")
         }
 
-        // Initialize camera select label and camera-toggle button
-        try {
-            updateCameraSelectLabel()
-            btnCameraSelect.setOnClickListener {
-                try {
-                    // If we're bound to the RecordingService, ask the service to switch camera
-                    // to avoid Activity unbinding CameraX (which can interrupt recording and cause missing output URIs).
-                    if (bound) {
-                        appendLog("Requesting service to switch camera (via ACTION_SWITCH_CAMERA)")
-                        try {
-                            val i = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_SWITCH_CAMERA }
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
-                        } catch (e: Exception) {
-                            appendLog("Failed to send ACTION_SWITCH_CAMERA: ${e.message}")
-                        }
-                        // disable toggle until service confirms switch to avoid rapid repeated toggles
-                        try { btnCameraSelect.isEnabled = false } catch (_: Exception) {}
-                        try {
-                            val parent = findViewById<View>(android.R.id.content)
-                            Snackbar.make(parent, "カメラを切り替えています…", Snackbar.LENGTH_SHORT).show()
-                        } catch (_: Exception) {}
-                        // UI label will be updated when the service broadcasts ACTION_CAMERA_SWITCHED
-                        // (do NOT optimistic-toggle here to avoid mismatch between UI and service state)
-                    } else {
-                        // toggle lens facing locally and restart camera
-                        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-                        appendLog("Camera toggled locally. New lensFacing=$lensFacing")
-                        startCamera()
-                        updateCameraSelectLabel()
-                    }
-                 } catch (e: Exception) {
-                     appendLog("Failed to toggle camera: ${e.message}")
-                 }
-             }
-         } catch (e: Exception) { appendLog("camera toggle init failed: ${e.message}") }
-
         // Enable clickable links in the log view so saved URIs can be tapped
         try {
             logView.movementMethod = LinkMovementMethod.getInstance()
@@ -747,45 +604,38 @@ class MainActivity : AppCompatActivity() {
         }
 
         recordButton.setOnClickListener {
-            if (isRecoveryInProgress) {
+            // Decide action robustly:
+            // - If the UI currently shows '停止' (record_stop), prefer stopping the service/recording
+            // - Otherwise if bound and service reports recording, stop
+            // - Else start a recording
+            val showingStop = recordButton.text == getString(R.string.record_stop)
+            val serviceIsRecording = bound && (recordingService?.isRecording() == true)
+
+            // If this click is intended to START recording, temporarily disable the button for 500ms
+            val isStart = !(showingStop || serviceIsRecording)
+            if (isStart) {
                 try {
-                    val parent = findViewById<View>(android.R.id.content)
-                    Snackbar.make(parent, "保存先を探索中のため開始できません。完了を待ってください", Snackbar.LENGTH_SHORT).show()
-                } catch (_: Exception) {}
-                return@setOnClickListener
+                    // Always disable immediately to prevent double-tap race
+                    recordButton.isEnabled = false
+                    mainHandler.postDelayed({
+                        try {
+                            if (!isFinishing && !isDestroyed) recordButton.isEnabled = true
+                        } catch (_: Exception) {
+                            // ignore
+                        }
+                    }, 500)
+                } catch (e: Exception) {
+                    android.util.Log.w("MainActivity", "failed to temporarily disable recordButton", e)
+                    appendLog("failed to temporarily disable recordButton: ${e.message}")
+                }
             }
-             // Decide action robustly:
-             // - If the UI currently shows '停止' (record_stop), prefer stopping the service/recording
-             // - Otherwise if bound and service reports recording, stop
-             // - Else start a recording
-             val showingStop = recordButton.text == getString(R.string.record_stop)
-             val serviceIsRecording = bound && ((recordingService as? com.example.silent.RecordingService)?.isRecording() == true)
 
-             // If this click is intended to START recording, temporarily disable the button for 500ms
-             val isStart = !(showingStop || serviceIsRecording)
-             if (isStart) {
-                 try {
-                     // Always disable immediately to prevent double-tap race
-                     recordButton.isEnabled = false
-                     mainHandler.postDelayed({
-                         try {
-                             if (!isFinishing && !isDestroyed) recordButton.isEnabled = true
-                         } catch (_: Exception) {
-                             // ignore
-                         }
-                     }, 500)
-                 } catch (e: Exception) {
-                     android.util.Log.w("MainActivity", "failed to temporarily disable recordButton", e)
-                     appendLog("failed to temporarily disable recordButton: ${e.message}")
-                 }
-             }
-
-             if (showingStop || serviceIsRecording) {
-                 stopRecording()
-             } else {
-                 startRecording()
-             }
-         }
+            if (showingStop || serviceIsRecording) {
+                stopRecording()
+            } else {
+                startRecording()
+            }
+        }
 
         requestPermissionsIfNeeded()
         updateAudioStatus()
@@ -827,25 +677,16 @@ class MainActivity : AppCompatActivity() {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
 
-            try {
-                val cameraSelector = if (lensFacing == CameraSelector.LENS_FACING_FRONT) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-                if (bound) {
-                    // When bound to the RecordingService, the service manages VideoCapture for recording.
-                    // Bind only the Preview here and avoid unbinding other use cases owned by the service.
-                    cameraProvider.bindToLifecycle(this, cameraSelector, preview)
-                    appendLog("Camera preview bound (service manages recording)")
-                } else {
-                    // Activity manages both preview and recording use-cases
-                    val recorder = Recorder.Builder()
-                        .setQualitySelector(QualitySelector.from(Quality.HD))
-                        .build()
-                    videoCapture = VideoCapture.withOutput(recorder)
+            val recorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(Quality.HD))
+                .build()
+            videoCapture = VideoCapture.withOutput(recorder)
 
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(this, cameraSelector, preview, videoCapture)
-                    updateCameraSelectLabel()
-                    appendLog("Camera started and bound to lifecycle (activity manages recording)")
-                }
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview, videoCapture)
+                appendLog("Camera started and bound to lifecycle")
             } catch (e: Exception) {
                 e.printStackTrace()
                 appendLog("Failed to start camera: ${e.message}")
@@ -853,7 +694,7 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // Entry point called by UI. This will ensure notification permission exists before starting a foreground service
+    // Entry point called by UI. This will ensure notification permission exists before starting service.
     private fun startRecording() {
         // On Android 13+ ensure POST_NOTIFICATIONS permission is granted before starting a foreground service
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -958,7 +799,7 @@ class MainActivity : AppCompatActivity() {
                 if (lp is FrameLayout.LayoutParams) { lp.gravity = Gravity.CENTER; snackView.layoutParams = lp }
                 snackbar.show()
                 appendLog("Snackbar shown: starting recording")
-            } catch (_: Exception) {}
+            } catch (_: Exception) { }
         } catch (e: Throwable) {
             android.util.Log.e("MainActivity", "Failed to start recording service (Throwable)", e)
             appendLog("Failed to start recording service: ${e.message}")
