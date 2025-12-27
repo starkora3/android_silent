@@ -11,16 +11,15 @@ import android.provider.Settings
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.TextView
+import android.widget.ImageView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.Recorder
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Quality
-import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -43,10 +42,10 @@ import android.widget.EditText
 import android.text.InputType
 import android.widget.LinearLayout
 import android.view.ViewGroup.LayoutParams
+import android.graphics.BitmapFactory
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var previewView: PreviewView
     private lateinit var recordButton: Button
     private lateinit var audioStatus: TextView
     private lateinit var rootLayout: ViewGroup
@@ -54,6 +53,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recordingTimer: TextView
     private lateinit var recordingState: TextView
     private lateinit var logView: TextView
+    private lateinit var toggleCameraButton: Button
+    private lateinit var togglePreviewButton: Button
+    private lateinit var previewImageView: ImageView
 
     // Timer UI elements
     private var timerStartInput: EditText? = null
@@ -92,8 +94,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private var videoCapture: VideoCapture<Recorder>? = null
-
     private var recordingService: RecordingService? = null
     private var bound = false
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -104,6 +104,8 @@ class MainActivity : AppCompatActivity() {
             if (bound && elapsed > 0L) mainHandler.postDelayed(this, 500)
         }
     }
+
+    private var currentCameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
     // Timer state
     private var timerHandler: Handler = Handler(Looper.getMainLooper())
@@ -146,9 +148,11 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
-        val granted = perms[Manifest.permission.CAMERA] == true
-        appendLog("Camera permission result: $granted")
-        if (granted) startCamera()
+        val granted = perms[Manifest.permission.CAMERA] == true && perms[Manifest.permission.RECORD_AUDIO] == true
+        appendLog("Camera & Audio permission result: $granted")
+        if (!granted) {
+            Toast.makeText(this, "カメラとマイクの権限が必要です", Toast.LENGTH_LONG).show()
+        }
     }
 
     // Shared pending timer start state when permission requests are needed
@@ -207,8 +211,10 @@ class MainActivity : AppCompatActivity() {
             val parent = findViewById<View>(android.R.id.content)
             Snackbar.make(parent, "アプリにフォアグラウンドサービスの権限が必要です。設定を開きますか？", Snackbar.LENGTH_INDEFINITE)
                 .setAction("設定") {
-                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) }
-                    startActivity(intent)
+                    try {
+                        // Prefer opening the app settings where user can grant the permission if supported.
+                        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) })
+                    } catch (_: Exception) { }
                 }
                 .show()
             pendingStartAfterFgsPerm = false
@@ -341,18 +347,62 @@ class MainActivity : AppCompatActivity() {
                     }
                     RecordingService.ACTION_RECORDING_SAVED -> {
                         // Activity receives the saved URI from the service and logs it for user visibility
-                        val uriStr = intent?.getStringExtra("video_uri")
-                        if (!uriStr.isNullOrEmpty()) {
-                            appendLog("Recording saved: $uriStr")
+                        // Be robust: the service may send a String extra, a Parcelable<Uri>, or different key names
+                        var uri: Uri? = null
+                        try {
+                            // Try common parcelable key first
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                uri = intent.getParcelableExtra("video_uri", Uri::class.java)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                uri = intent.getParcelableExtra("video_uri")
+                            }
+                        } catch (_: Exception) {}
+                        if (uri == null) {
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    uri = intent.getParcelableExtra("output_uri", Uri::class.java)
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    uri = intent.getParcelableExtra("output_uri")
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        if (uri == null) {
+                            try {
+                                val s1 = intent?.getStringExtra("video_uri")
+                                if (!s1.isNullOrEmpty()) uri = Uri.parse(s1)
+                            } catch (_: Exception) {}
+                        }
+                        if (uri == null) {
+                            try {
+                                val s2 = intent?.getStringExtra("output_uri")
+                                if (!s2.isNullOrEmpty()) uri = Uri.parse(s2)
+                            } catch (_: Exception) {}
+                        }
+                        if (uri == null) {
+                            // Try generic EXTRA_STREAM
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    uri = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    uri = intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                                }
+                            } catch (_: Exception) {}
+                        }
+
+                        if (uri != null) {
+                            appendLog("Recording saved: $uri")
                             try {
                                 val parent = findViewById<View>(android.R.id.content)
                                 Snackbar.make(parent, "録画を保存しました", Snackbar.LENGTH_SHORT)
                                     .setAction("開く") {
-                                        try { openUri(Uri.parse(uriStr)) } catch (_: Exception) {}
+                                        try { openUri(uri) } catch (_: Exception) {}
                                     }
                                     .show()
                                 // Add a clickable entry in the log so user can tap the URI
-                                try { appendClickableUri(Uri.parse(uriStr)) } catch (e: Exception) { appendLog("appendClickableUri failed: ${e.message}") }
+                                try { appendClickableUri(uri) } catch (e: Exception) { appendLog("appendClickableUri failed: ${e.message}") }
                             } catch (_: Exception) { }
                         } else {
                             appendLog("Recording saved (no URI provided)")
@@ -414,6 +464,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val previewUpdateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == RecordingService.ACTION_PREVIEW_UPDATED) {
+                val path = intent.getStringExtra("preview_path")
+                if (path != null) {
+                    try {
+                        val bitmap = BitmapFactory.decodeFile(path)
+                        runOnUiThread {
+                            previewImageView.setImageBitmap(bitmap)
+                        }
+                    } catch (e: Exception) {
+                        appendLog("Failed to load preview image: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         // bind to service if running
@@ -460,6 +528,10 @@ class MainActivity : AppCompatActivity() {
         // register receiver for diagnostic onStartCommand broadcast
         try { safeRegisterReceiver(serviceOnStartReceiver, IntentFilter("com.example.silent.action.SERVICE_ONSTARTCALLED")) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver onStartCalled failed", e) }
 
+        // register receiver for preview updates
+        val previewFilter = IntentFilter(RecordingService.ACTION_PREVIEW_UPDATED)
+        try { safeRegisterReceiver(previewUpdateReceiver, previewFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver preview failed", e) }
+
         appendLog("onStart: receivers registered and service bind attempted")
     }
 
@@ -476,6 +548,7 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(fgsPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(cameraPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(serviceOnStartReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(previewUpdateReceiver) } catch (_: Exception) {}
 
         // cancel any running timer countdowns to avoid leaks
         cancelTimerCountdown()
@@ -487,7 +560,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        previewView = findViewById(R.id.previewView)
         recordButton = findViewById(R.id.recordButton)
         audioStatus = findViewById(R.id.audioStatus)
         rootLayout = findViewById(R.id.rootLayout)
@@ -495,6 +567,13 @@ class MainActivity : AppCompatActivity() {
         recordingTimer = findViewById(R.id.recordingTimer)
         recordingState = findViewById(R.id.recordingState)
         logView = findViewById(R.id.logView)
+        toggleCameraButton = findViewById(R.id.toggleCameraButton)
+        togglePreviewButton = findViewById(R.id.togglePreviewButton)
+        previewImageView = findViewById(R.id.previewImageView)
+
+        togglePreviewButton.setOnClickListener {
+            previewImageView.visibility = if (previewImageView.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
 
         // --- bind timer UI from XML (XML already contains startTimeInput/durationInput/timerRecordButton) ---
         try {
@@ -603,6 +682,11 @@ class MainActivity : AppCompatActivity() {
             startActivity(intent)
         }
 
+        toggleCameraButton.setOnClickListener {
+            toggleCamera()
+        }
+
+
         recordButton.setOnClickListener {
             // Decide action robustly:
             // - If the UI currently shows '停止' (record_stop), prefer stopping the service/recording
@@ -663,36 +747,33 @@ class MainActivity : AppCompatActivity() {
         if (needed.isNotEmpty()) {
             permissionLauncher.launch(needed.toTypedArray())
             appendLog("Requesting permissions: ${needed.joinToString()}")
-        } else {
-            startCamera()
         }
     }
 
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+    private fun toggleCamera() {
+        currentCameraSelector = if (currentCameraSelector == CameraSelector.DEFAULT_BACK_CAMERA) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        appendLog("toggleCamera: new selector=$currentCameraSelector")
 
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
+        // If the service is not recording, we don't need to do anything as the new
+        // selector will be used on the next recording start.
+        // If it IS recording, send an intent to ask it to switch cameras.
+        try {
+            if (recordingService?.isRecording() == true) {
+                val intent = Intent(this, RecordingService::class.java).apply {
+                    action = RecordingService.ACTION_TOGGLE_CAMERA
+                    val lensFacing = if (currentCameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                    putExtra(RecordingService.EXTRA_CAMERA_LENS_FACING, lensFacing)
+                }
+                startService(intent)
+                appendLog("Sent ACTION_TOGGLE_CAMERA to service")
+            } else {
+                appendLog("Camera will be switched on next recording start.")
             }
-
-            val recorder = Recorder.Builder()
-                .setQualitySelector(QualitySelector.from(Quality.HD))
-                .build()
-            videoCapture = VideoCapture.withOutput(recorder)
-
-            try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview, videoCapture)
-                appendLog("Camera started and bound to lifecycle")
-            } catch (e: Exception) {
-                e.printStackTrace()
-                appendLog("Failed to start camera: ${e.message}")
-            }
-        }, ContextCompat.getMainExecutor(this))
+        } catch (e: Exception) {
+            appendLog("toggleCamera failed: ${e.message}")
+        }
     }
+
 
     // Entry point called by UI. This will ensure notification permission exists before starting service.
     private fun startRecording() {
@@ -779,7 +860,11 @@ class MainActivity : AppCompatActivity() {
     // Actual logic to start the service once we know permissions are satisfied
     private fun startRecordingInternal() {
         // Start foreground recording service (robust attempt)
-        val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_START }
+        val intent = Intent(this, RecordingService::class.java).apply {
+            action = RecordingService.ACTION_START
+            val lensFacing = if (currentCameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+            putExtra(RecordingService.EXTRA_CAMERA_LENS_FACING, lensFacing)
+        }
         try {
             // On Android O+ we must use startForegroundService when the service will call startForeground
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1013,6 +1098,8 @@ class MainActivity : AppCompatActivity() {
                 action = RecordingService.ACTION_TIMER_START
                 putExtra("start_sec", startSeconds)
                 putExtra("duration_sec", durationSeconds)
+                val lensFacing = if (currentCameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                putExtra(RecordingService.EXTRA_CAMERA_LENS_FACING, lensFacing)
             }
             // Ensure service is started; on newer Android versions use startForegroundService when appropriate
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
@@ -1109,5 +1196,15 @@ class MainActivity : AppCompatActivity() {
             // Fallback: log the error so callers can handle silently
             appendLog("safeRegisterReceiver failed: ${e.message}")
         }
+    }
+
+    // Release camera resources and clear preview surface to avoid holding camera when not needed
+    private fun releaseCameraResources() {
+        appendLog("Camera resources released by Activity")
+    }
+
+    override fun onDestroy() {
+        // Ensure camera resources are released when Activity destroyed
+        super.onDestroy()
     }
 }

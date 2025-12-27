@@ -30,662 +30,383 @@ import android.Manifest
 import java.util.concurrent.Executors
 import android.os.Handler
 import android.os.Looper
+import androidx.camera.core.Camera
+import androidx.camera.video.VideoRecordEvent
+import androidx.core.app.ActivityCompat
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import java.io.FileOutputStream
+import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.Date
+import java.util.concurrent.ExecutorService
+import android.content.pm.ServiceInfo
+import androidx.camera.video.Recording
 
-class RecordingService : Service(), LifecycleOwner {
-
-    companion object {
-        const val ACTION_START = "com.example.silent.action.START_RECORDING"
-        const val ACTION_STOP = "com.example.silent.action.STOP_RECORDING"
-        const val ACTION_RECORDING_SAVED = "com.example.silent.action.RECORDING_SAVED"
-        const val ACTION_NOTIFICATION_PERMISSION_REQUIRED = "com.example.silent.action.NOTIF_PERMISSION_REQUIRED"
-        // New: notify Activity that FOREGROUND_SERVICE permission appears to be missing
-        const val ACTION_FOREGROUND_PERMISSION_REQUIRED = "com.example.silent.action.FOREGROUND_PERMISSION_REQUIRED"
-        // New: notify Activity that microphone-specific foreground permission is required on Android 15+
-        const val ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED = "com.example.silent.action.FOREGROUND_MIC_PERMISSION_REQUIRED"
-        // Broadcasts to notify UI of recording state changes
-        const val ACTION_RECORDING_STARTED = "com.example.silent.action.RECORDING_STARTED"
-        const val ACTION_RECORDING_STOPPED = "com.example.silent.action.RECORDING_STOPPED"
-        const val CHANNEL_ID = "recording_channel"
-        const val NOTIF_ID = 1001
-        // New: notify Activity that CAMERA permission is required
-        const val ACTION_CAMERA_PERMISSION_REQUIRED = "com.example.silent.action.CAMERA_PERMISSION_REQUIRED"
-        // Timer-related actions (new)
-        const val ACTION_TIMER_START = "com.example.silent.action.TIMER_START"
-        const val ACTION_TIMER_CANCEL = "com.example.silent.action.TIMER_CANCEL"
-        const val ACTION_TIMER_TICK = "com.example.silent.action.TIMER_TICK"
-        const val ACTION_TIMER_STARTED = "com.example.silent.action.TIMER_STARTED"
-        const val ACTION_TIMER_CANCELLED = "com.example.silent.action.TIMER_CANCELLED"
-    }
-
-    // Timer state
-    private var timerHandler: Handler? = null
-    private var timerRunnable: Runnable? = null
-    private var timerRemainingStartSec: Int = 0
-    private var timerRemainingRecSec: Int = 0
-    private var timerPhase: Int = 0 // 0=idle,1=waiting,2=recording
-    private var timerTriggeredRecording: Boolean = false
-    private var timerRequestId: String? = null
-
-    private var cameraProvider: ProcessCameraProvider? = null
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var currentRecording: androidx.camera.video.Recording? = null
+class RecordingService : LifecycleService() {
 
     private val binder = LocalBinder()
-    private var startTime: Long = 0L
+    private var isRecording = false
+    private var recordingStartTime: Long = 0L
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var imageCapture: ImageCapture? = null
+    private var activeRecording: Recording? = null
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var currentCameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+    private lateinit var cameraExecutor: ExecutorService
 
-    // Explicit recording flag to avoid races between callbacks and explicit stop
-    @Volatile
-    private var isRecordingFlag = false
+    // Timer-related state
+    private var timerJob: Job? = null
+    private var timerDurationSec = 0
+    private var timerStartSec = 0
 
-    // Track whether we've successfully called startForeground so we don't get ANR when
-    // startForegroundService() was used to start the service.
-    private var isForegroundStarted = false
-
-    // Track whether we've already informed the Activity about missing permissions to avoid loops
-    private var notifPermissionBroadcastSent = false
-    private var fgsPermissionBroadcastSent = false
+    // Preview update job
+    private var previewUpdateJob: Job? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): RecordingService = this@RecordingService
     }
 
-    private val lifecycleRegistry = LifecycleRegistry(this)
-    private val bgExecutor = Executors.newSingleThreadExecutor()
+    override fun onBind(intent: Intent): IBinder {
+        super.onBind(intent)
+        return binder
+    }
 
     override fun onCreate() {
         super.onCreate()
-        // initialize lifecycle
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        createNotificationChannel()
-
-        // Immediately attempt to enter foreground so that startForegroundService callers
-        // do not trigger ForegroundServiceDidNotStartInTimeException on newer Android.
-        // This is done early in onCreate (before onStartCommand heavy work) to satisfy
-        // the platform's requirement that a service started via startForegroundService
-        // must call startForeground promptly.
-        try {
-            if (!isForegroundStarted) {
-                startForeground(NOTIF_ID, buildNotification("サービス初期化中"))
-                isForegroundStarted = true
-                Log.i("RecordingService", "Entered foreground in onCreate to avoid timing ANR")
-            }
-        } catch (se: SecurityException) {
-            Log.e("RecordingService", "startForeground in onCreate failed due to missing notification/foreground permission", se)
-            try {
-                // If running on Android 15+ the missing permission may be the microphone FGS permission
-                if (Build.VERSION.SDK_INT >= 35 && ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
-                    sendPermissionBroadcastOnce(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
-                } else
-                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                     sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
-                 } else {
-                     sendPermissionBroadcastOnce(ACTION_FOREGROUND_PERMISSION_REQUIRED)
-                 }
-            } catch (e: Exception) {
-                Log.e("RecordingService", "failed to send permission-required broadcast from onCreate", e)
-            }
-            // Ensure we don't keep the service running without having entered foreground; stop to avoid ANR
-            try {
-                stopSelf()
-                Log.i("RecordingService", "Stopped service after failed startForeground in onCreate to avoid ANR")
-            } catch (e: Exception) {
-                Log.e("RecordingService", "stopSelf failed after startForeground failure", e)
-            }
-            return
-        } catch (e: Exception) {
-            Log.e("RecordingService", "startForeground in onCreate failed", e)
-            // If startForeground failed for any other reason, stop service to avoid timing issues
-            try { stopSelf() } catch (ex: Exception) { Log.e("RecordingService", "stopSelf failed after startForeground exception", ex) }
-            return
-        }
-
-        // Initialize camera provider asynchronously but RUN binding on the main thread
-        try {
-            // Use the CameraX provided async mechanism and run binding on the main executor.
-            val future = ProcessCameraProvider.getInstance(applicationContext)
-            future.addListener({
-                try {
-                    val provider = future.get()
-                    cameraProvider = provider
-                    Log.i("RecordingService", "CameraProvider initialized (main): $cameraProvider")
-                    // move lifecycle to STARTED so bindToLifecycle works
-                    lifecycleRegistry.currentState = Lifecycle.State.STARTED
-                    // bind video use case on main thread
-                    setupVideoCapture()
-                } catch (e: Exception) {
-                    Log.e("RecordingService", "Failed to init CameraProvider on main executor", e)
-                }
-            }, ContextCompat.getMainExecutor(this))
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Failed to request CameraProvider", e)
-        }
+        cameraExecutor = Executors.newSingleThreadExecutor()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Use WARN to increase chance the log is visible on devices with info-level filtering
-        Log.w("RecordingService", "onStartCommand received intent action=${intent?.action}")
-        // Also notify Activity for immediate UI visibility that onStartCommand was entered
-        try {
-            val b = Intent("com.example.silent.action.SERVICE_ONSTARTCALLED").apply { putExtra("action", intent?.action) }
-            sendLocalBroadcast(b)
-        } catch (e: Exception) {
-            Log.w("RecordingService", "failed to send onStartCalled broadcast", e)
-        }
-         when (intent?.action) {
-             ACTION_TIMER_START -> {
-                 // If startForegroundService was used by the caller, we MUST call startForeground promptly to avoid ANR.
-                 try {
-                     if (!isForegroundStarted) {
-                         startForeground(NOTIF_ID, buildNotification("タイマー録画待機中"))
-                         isForegroundStarted = true
-                     }
-                 } catch (se: SecurityException) {
-                     Log.e("RecordingService", "startForeground failed due to missing notification or foreground permission (timer)", se)
-                     try {
-                         if (Build.VERSION.SDK_INT >= 35 && ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
-                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
-                         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                             sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
-                         } else {
-                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_PERMISSION_REQUIRED)
-                         }
-                     } catch (e: Exception) {
-                         Log.e("RecordingService", "failed to send permission-required broadcast (timer)", e)
-                     }
-                     // Stop service to avoid ANR if we couldn't enter foreground
-                     stopSelf()
-                     return START_NOT_STICKY
-                 } catch (re: Exception) {
-                     Log.e("RecordingService", "startForeground failed (timer) with exception", re)
-                     try { sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast (timer)", e) }
-                     stopSelf()
-                     return START_NOT_STICKY
-                 }
+        super.onStartCommand(intent, flags, startId)
+        val action = intent?.action ?: ""
+        // Send a diagnostic broadcast so the Activity can log that onStartCommand was entered
+        try { sendBroadcast(Intent("com.example.silent.action.SERVICE_ONSTARTCALLED").putExtra("action", action).setPackage(packageName)) } catch (_: Exception) {}
 
-                 // start timer in service
-                 val startSec = intent.getIntExtra("start_sec", 0)
-                 val durSec = intent.getIntExtra("duration_sec", 0)
-                 Log.i("RecordingService", "Received ACTION_TIMER_START start=$startSec dur=$durSec")
-                 startTimer(startSec, durSec)
-             }
-             ACTION_TIMER_CANCEL -> {
-                 Log.i("RecordingService", "Received ACTION_TIMER_CANCEL")
-                 cancelTimer()
-             }
-             ACTION_START -> {
-                // Removed incorrect runtime permission check for FOREGROUND_SERVICE
-                // and removed the pre-check that aborted start when POST_NOTIFICATIONS
-                // was not yet granted. Instead we always attempt to enter foreground
-                // and handle SecurityException if notification permission is missing.
-
-                // Try to enter foreground quickly with a minimal notification to satisfy system timing
-                try {
-                    if (!isForegroundStarted) {
-                        startForeground(NOTIF_ID, buildNotification("録画を開始しています"))
-                        isForegroundStarted = true
-                    }
-                } catch (se: SecurityException) {
-                    Log.e("RecordingService", "startForeground failed due to missing notification or foreground permission", se)
-                    // Determine likely missing permission and notify Activity accordingly.
-                    try {
-                         if (Build.VERSION.SDK_INT >= 35 && ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
-                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED)
-                         } else
-                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                             // On Android 13+, missing POST_NOTIFICATIONS will cause startForeground to fail; ask Activity to request notification permission
-                             sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
-                         } else {
-                             // Otherwise, inform Activity that FOREGROUND_SERVICE permission may be required (some ROMs enforce additional checks)
-                             sendPermissionBroadcastOnce(ACTION_FOREGROUND_PERMISSION_REQUIRED)
-                         }
-                    } catch (e: Exception) {
-                        Log.e("RecordingService", "failed to send permission-required broadcast", e)
-                    }
-                     // Stop the service to avoid ForegroundServiceDidNotStartInTimeException
-                     try {
-                         stopSelf()
-                         Log.i("RecordingService", "Stopped service after failed startForeground in ACTION_START to avoid ANR")
-                     } catch (e: Exception) {
-                         Log.e("RecordingService", "stopSelf failed after startForeground failure in ACTION_START", e)
-                     }
-                     return START_NOT_STICKY
-                } catch (re: Exception) {
-                    Log.e("RecordingService", "startForeground failed with exception", re)
-                    try { sendPermissionBroadcastOnce(ACTION_NOTIFICATION_PERMISSION_REQUIRED) } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast", e) }
-                    // include exception message in a broadcast for better debug on problematic Android builds
-                    try {
-                        val b = Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
-                        b.putExtra("error", re.message)
-                        sendLocalBroadcast(b)
-                    } catch (e: Exception) { Log.e("RecordingService", "failed to send notif-permission-required broadcast with error detail", e) }
-                    // Stop service to avoid ANR
-                    try { stopSelf() } catch (ex: Exception) { Log.e("RecordingService", "stopSelf failed after startForeground exception in ACTION_START", ex) }
-                    return START_NOT_STICKY
-                }
-
-                // Start actual recording on the main thread (CameraX/Lifecycle must be used from main)
-                ContextCompat.getMainExecutor(this).execute {
-                    try {
-                        startRecording()
-                    } catch (e: Exception) {
-                        Log.e("RecordingService", "startRecording failed", e)
-                        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-                        stopSelf()
-                    }
-                }
+        when (action) {
+            ACTION_START -> {
+                val lensFacing = intent?.getIntExtra(EXTRA_CAMERA_LENS_FACING, CameraSelector.LENS_FACING_BACK) ?: CameraSelector.LENS_FACING_BACK
+                startRecording(lensFacing)
             }
             ACTION_STOP -> {
-                // Ensure stopRecording executes on main thread because CameraX interactions must run there
-                try {
-                    ContextCompat.getMainExecutor(this).execute {
-                        try { stopRecording() } catch (e: Exception) { Log.e("RecordingService", "stopRecording error", e) }
-                    }
-                } catch (e: Exception) {
-                    Log.e("RecordingService", "failed to dispatch stopRecording to main", e)
-                }
-                try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-                // clear flag when stopping foreground
-                try { isForegroundStarted = false } catch (_: Exception) {}
-                stopSelf()
+                stopRecording()
             }
-         }
-         return START_STICKY
-     }
-
-    private fun startTimer(startSec: Int, durSec: Int) {
-        // cancel any existing timer
-        cancelTimer()
-        if (durSec <= 0) {
-            Log.w("RecordingService", "startTimer: invalid duration $durSec")
-            return
-        }
-        timerHandler = Handler(Looper.getMainLooper())
-        timerRemainingStartSec = startSec
-        timerRemainingRecSec = durSec
-        timerPhase = if (startSec > 0) 1 else 2
-        timerTriggeredRecording = false
-
-        // send initial tick for immediate UI feedback
-        sendTimerTick()
-
-        timerRunnable = object : Runnable {
-            override fun run() {
-                try {
-                    if (timerPhase == 1) {
-                        if (timerRemainingStartSec <= 0) {
-                            // transition to recording
-                            Log.i("RecordingService", "Timer: start reached 0, beginning recording")
-                            timerPhase = 2
-                            // start recording on main executor
-                            ContextCompat.getMainExecutor(this@RecordingService).execute {
-                                try {
-                                    startRecording()
-                                    timerTriggeredRecording = true
-                                    // notify that timer-triggered recording started
-                                    try { sendLocalBroadcast(Intent(ACTION_TIMER_STARTED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast ACTION_TIMER_STARTED failed", e) }
-                                } catch (e: Exception) {
-                                    Log.e("RecordingService", "startRecording from timer failed", e)
-                                }
-                            }
-                            // start recording countdown after a short delay to allow recording to start
-                            timerHandler?.postDelayed(this, 1000)
-                            return
-                        } else {
-                            // countdown before start
-                            sendTimerTick()
-                            timerRemainingStartSec -= 1
-                            timerHandler?.postDelayed(this, 1000)
-                            return
-                        }
-                    } else if (timerPhase == 2) {
-                        if (timerRemainingRecSec <= 0) {
-                            Log.i("RecordingService", "Timer: recording duration finished, stopping")
-                            // stop recording and notify
-                            try { ContextCompat.getMainExecutor(this@RecordingService).execute { stopRecording() } } catch (e: Exception) { Log.e("RecordingService", "stopRecording error", e) }
-                            timerPhase = 0
-                            timerTriggeredRecording = false
-                            try { sendLocalBroadcast(Intent(ACTION_TIMER_CANCELLED).apply { putExtra("reason", "finished") }) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast ACTION_TIMER_CANCELLED failed", e) }
-                            return
-                        } else {
-                            sendTimerTick()
-                            timerRemainingRecSec -= 1
-                            timerHandler?.postDelayed(this, 1000)
-                            return
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("RecordingService", "timerRunnable error", e)
+            ACTION_TIMER_START -> {
+                val startSec = intent?.getIntExtra("start_sec", 0) ?: 0
+                val durSec = intent?.getIntExtra("duration_sec", 0) ?: 0
+                val lensFacing = intent?.getIntExtra(EXTRA_CAMERA_LENS_FACING, CameraSelector.LENS_FACING_BACK) ?: CameraSelector.LENS_FACING_BACK
+                startTimer(startSec, durSec, lensFacing)
+            }
+            ACTION_TIMER_CANCEL -> {
+                cancelTimer()
+            }
+            ACTION_TOGGLE_CAMERA -> {
+                val lensFacing = intent?.getIntExtra(EXTRA_CAMERA_LENS_FACING, -1) ?: -1
+                if (lensFacing != -1) {
+                    toggleCamera(lensFacing)
                 }
             }
         }
-
-        // start the runnable immediately (first tick already sent)
-        timerHandler?.postDelayed(timerRunnable!!, 1000)
+        return START_STICKY
     }
 
-    private fun sendTimerTick() {
-        try {
-            val intent = Intent(ACTION_TIMER_TICK)
-            if (timerPhase == 1) {
-                intent.putExtra("phase", "waiting")
-                intent.putExtra("remaining_sec", timerRemainingStartSec)
-            } else if (timerPhase == 2) {
-                intent.putExtra("phase", "recording")
-                intent.putExtra("remaining_sec", timerRemainingRecSec)
-            } else {
-                intent.putExtra("phase", "idle")
-                intent.putExtra("remaining_sec", 0)
+    private fun startForegroundNotification(text: String) {
+        // On Android 13+, ensure we have permission to post notifications before trying
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                // Send a broadcast to the Activity to request permission
+                sendBroadcast(Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED).setPackage(packageName))
+                // Stop the service to avoid ANR if permission is not granted
+                stopSelf()
+                return
             }
-            sendLocalBroadcast(intent)
+        }
+        // On Android 12+, ensure we have foreground service permission
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
+                    sendBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED).setPackage(packageName))
+                    stopSelf()
+                    return
+                }
+            } catch (e: Exception) {
+                // some ROMs might throw SecurityException here
+                sendBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED).setPackage(packageName))
+                stopSelf()
+                return
+            }
+        }
+        // On Android 15+, ensure we have microphone foreground service permission
+        if (Build.VERSION.SDK_INT >= 35) {
+            try {
+                if (ContextCompat.checkSelfPermission(this, "android.permission.FOREGROUND_SERVICE_MICROPHONE") != PackageManager.PERMISSION_GRANTED) {
+                    sendBroadcast(Intent(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED).setPackage(packageName))
+                    stopSelf()
+                    return
+                }
+            } catch (e: Exception) {
+                sendBroadcast(Intent(ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED).setPackage(packageName))
+                stopSelf()
+                return
+            }
+        }
+
+
+        val pendingIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Recording")
+            .setContentText(text)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentIntent(pendingIntent)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(1, notification)
+            }
         } catch (e: Exception) {
-            Log.w("RecordingService", "sendTimerTick failed", e)
+            // Log and try to recover if possible
+            Log.e(TAG, "startForeground failed", e)
+            // Fallback for older devices or ROMs with stricter background start rules
+            try {
+                startForeground(1, notification)
+            } catch (e2: Exception) {
+                Log.e(TAG, "startForeground fallback failed", e2)
+                // If all attempts fail, notify the user and stop the service
+                sendBroadcast(Intent(ACTION_FOREGROUND_PERMISSION_REQUIRED).setPackage(packageName))
+                stopSelf()
+            }
+        }
+    }
+
+    private fun setupCamera(lensFacing: Int) {
+        currentCameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            try {
+                cameraProvider = cameraProviderFuture.get()
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(QualitySelector.from(Quality.HD))
+                    .build()
+                videoCapture = VideoCapture.withOutput(recorder)
+
+                imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build()
+
+                cameraProvider?.unbindAll()
+                cameraProvider?.bindToLifecycle(this, currentCameraSelector, videoCapture, imageCapture)
+
+                val vc = videoCapture
+                if (vc != null) {
+                    startRecordingInternal(vc)
+                    // 録画開始後、定期的にプレビュー画像をキャプチャ
+                    startPreviewCapture()
+                } else {
+                    Log.e(TAG, "VideoCapture is null after camera setup.")
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to set up camera", e)
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun startPreviewCapture() {
+        previewUpdateJob?.cancel()
+        previewUpdateJob = lifecycleScope.launch {
+            while (isRecording) {
+                capturePreviewImage()
+                delay(1000) // 1秒ごとにキャプチャ
+            }
+        }
+    }
+
+    private fun capturePreviewImage() {
+        val ic = imageCapture ?: return
+        val file = File(cacheDir, "preview.jpg")
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+
+        ic.takePicture(
+            outputOptions,
+            cameraExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    // プレビュー更新を通知
+                    val intent = Intent(ACTION_PREVIEW_UPDATED).apply {
+                        putExtra("preview_path", file.absolutePath)
+                        setPackage(packageName)
+                    }
+                    sendBroadcast(intent)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    Log.e(TAG, "Failed to capture preview image", exception)
+                }
+            }
+        )
+    }
+
+
+    private fun startRecording(lensFacing: Int) {
+        setupCamera(lensFacing)
+    }
+
+    private fun startRecordingInternal(vc: VideoCapture<Recorder>) {
+        if (isRecording) return
+        isRecording = true
+        recordingStartTime = System.currentTimeMillis()
+
+        startForegroundNotification("録画を開始しました")
+
+        val name = "video_${System.currentTimeMillis()}.mp4"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+        }
+        val mediaStoreOutput = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            .setContentValues(contentValues)
+            .build()
+
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            // This should ideally be handled in the Activity, but as a fallback:
+            Toast.makeText(this, "マイクの権限がありません", Toast.LENGTH_SHORT).show()
+            isRecording = false
+            stopSelf()
+            return
+        }
+
+        activeRecording = vc.output
+            .prepareRecording(this, mediaStoreOutput)
+            .withAudioEnabled()
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        sendBroadcast(Intent(ACTION_RECORDING_STARTED).setPackage(packageName))
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        if (!event.hasError()) {
+                            val uri = event.outputResults.outputUri
+                            val intent = Intent(ACTION_RECORDING_SAVED).apply {
+                                putExtra("video_uri", uri)
+                                setPackage(packageName)
+                            }
+                            sendBroadcast(intent)
+                        } else {
+                            Log.e(TAG, "Video recording failed: Error: ${event.error}, Cause: ${event.cause?.message}")
+                        }
+                        stopRecording()
+                    }
+                }
+            }
+    }
+
+    private fun stopRecording() {
+        previewUpdateJob?.cancel()
+        previewUpdateJob = null
+        activeRecording?.stop()
+        activeRecording = null
+        isRecording = false
+        recordingStartTime = 0L
+        stopForeground(true)
+        stopSelf()
+        sendBroadcast(Intent(ACTION_RECORDING_STOPPED).setPackage(packageName))
+        cameraProvider?.unbindAll()
+    }
+
+    private fun toggleCamera(lensFacing: Int) {
+        if (isRecording) {
+            activeRecording?.stop()
+            activeRecording = null
+            setupCamera(lensFacing)
+        } else {
+            setupCamera(lensFacing)
+        }
+    }
+
+    private fun startTimer(startSec: Int, durSec: Int, lensFacing: Int) {
+        cancelTimer()
+        timerStartSec = startSec
+        timerDurationSec = durSec
+        timerJob = CoroutineScope(Dispatchers.Main).launch {
+            // Countdown to start
+            for (i in startSec downTo 1) {
+                val intent = Intent(ACTION_TIMER_TICK).apply {
+                    putExtra("remaining_sec", i)
+                    putExtra("phase", "waiting")
+                    setPackage(packageName)
+                }
+                sendBroadcast(intent)
+                startForegroundNotification("録画開始まで: $i 秒")
+                delay(1000)
+            }
+
+            // Start recording
+            startRecording(lensFacing)
+            sendBroadcast(Intent(ACTION_TIMER_STARTED).setPackage(packageName))
+
+            // Countdown for duration
+            for (i in durSec downTo 1) {
+                val intent = Intent(ACTION_TIMER_TICK).apply {
+                    putExtra("remaining_sec", i)
+                    putExtra("phase", "recording")
+                    setPackage(packageName)
+                }
+                sendBroadcast(intent)
+                startForegroundNotification("録画中: 残り $i 秒")
+                delay(1000)
+            }
+
+            // Stop recording
+            stopRecording()
         }
     }
 
     private fun cancelTimer() {
-        try {
-            timerRunnable?.let { timerHandler?.removeCallbacks(it) }
-        } catch (e: Exception) { /* ignore */ }
-        timerRunnable = null
-        timerHandler = null
-        val wasRecordingTriggered = timerTriggeredRecording
-        timerTriggeredRecording = false
-        timerPhase = 0
-        try { sendLocalBroadcast(Intent(ACTION_TIMER_CANCELLED).apply { putExtra("reason", "user_cancel") }) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast ACTION_TIMER_CANCELLED failed", e) }
-        // If the recording was started by this timer, stop it as user requested
-        if (wasRecordingTriggered && isRecordingFlag) {
-            try { ContextCompat.getMainExecutor(this).execute { stopRecording() } } catch (e: Exception) { Log.e("RecordingService", "stopRecording on cancel error", e) }
-        }
+        timerJob?.cancel()
+        timerJob = null
+        stopForeground(true)
+        sendBroadcast(Intent(ACTION_TIMER_CANCELLED).setPackage(packageName))
     }
 
-    private fun setupVideoCapture() {
-        val recorder = Recorder.Builder()
-            .setQualitySelector(QualitySelector.from(Quality.HD))
-            .build()
-        videoCapture = VideoCapture.withOutput(recorder)
-        try {
-            if (cameraProvider == null) {
-                Log.w("RecordingService", "setupVideoCapture: cameraProvider is null, cannot bind")
-                return
-            }
-            // Ensure binding happens on the main thread; caller should already be main but guard here
-            ContextCompat.getMainExecutor(this).execute {
-                try {
-                    cameraProvider?.unbindAll()
-                    // bind using this service's lifecycle
-                    Log.i("RecordingService", "Binding camera to lifecycle: $lifecycle")
-                    cameraProvider?.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, videoCapture)
-                    Log.i("RecordingService", "Camera bound")
-                } catch (e: Exception) {
-                    Log.e("RecordingService", "setupVideoCapture bind failed on main executor", e)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("RecordingService", "setupVideoCapture bind failed", e)
-        }
-    }
+    fun isRecording(): Boolean = isRecording
+    fun getElapsedMs(): Long = if (isRecording) System.currentTimeMillis() - recordingStartTime else 0L
 
-    private fun startRecording() {
-        val vc = videoCapture
-        // permission checks: ensure CAMERA permission is granted before attempting to use CameraX
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            Log.e("RecordingService", "startRecording: CAMERA permission not granted")
-            // Notify Activity that camera permission is required so it can request permissions
-            try { sendLocalBroadcast(Intent(ACTION_CAMERA_PERMISSION_REQUIRED)) } catch (_: Exception) {}
-            stopSelf()
-            return
-        }
-
-        if (vc == null) {
-            Log.e("RecordingService", "startRecording: videoCapture is null (cameraProvider prepared: ${cameraProvider != null})")
-            Toast.makeText(this, "カメラが準備できていません", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val name = "video_${System.currentTimeMillis()}"
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MyVideoApp")
-            }
-        }
-        val outputOptions = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(contentValues)
-            .build()
-
-        // Prepare and start recording. Use returned Recording object to detect active state immediately.
-        try {
-            val prepared = vc.output
-                .prepareRecording(this, outputOptions)
-                .apply {
-                    if (ContextCompat.checkSelfPermission(this@RecordingService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                        withAudioEnabled()
-                    }
-                }
-
-            // start returns Recording immediately; set state before callback to avoid races
-            val recording = prepared.start(ContextCompat.getMainExecutor(this)) { event ->
-                when (event) {
-                    is androidx.camera.video.VideoRecordEvent.Start -> {
-                        // Start event: update notification
-                        try {
-                            val nm = NotificationManagerCompat.from(this@RecordingService)
-                            nm.notify(NOTIF_ID, buildNotification("録画中"))
-                        } catch (e: Exception) {
-                            Log.w("RecordingService", "notify failed", e)
-                        }
-                        // Ensure UI knows recording started (if not already)
-                        try { sendLocalBroadcast(Intent(ACTION_RECORDING_STARTED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast started failed", e) }
-                        synchronized(this@RecordingService) {
-                            if (!isRecordingFlag) {
-                                isRecordingFlag = true
-                                startTime = System.currentTimeMillis()
-                            }
-                        }
-                    }
-                    is androidx.camera.video.VideoRecordEvent.Finalize -> {
-                        // stop foreground when finished
-                        try { stopForeground(STOP_FOREGROUND_DETACH) } catch (_: Exception) {}
-                        // clear flag when foreground stopped
-                        try { isForegroundStarted = false } catch (_: Exception) {}
-                        val savedUri = event.outputResults.outputUri
-                        if (savedUri != null) {
-                            val b = Intent(ACTION_RECORDING_SAVED).apply { putExtra("video_uri", savedUri.toString()) }
-                            try { sendLocalBroadcast(b) } catch (e: Exception) { Log.e("RecordingService", "sendBroadcast failed", e) }
-                        }
-                        synchronized(this@RecordingService) {
-                            isRecordingFlag = false
-                            currentRecording = null
-                            startTime = 0L
-                        }
-                        try { sendLocalBroadcast(Intent(ACTION_RECORDING_STOPPED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast stopped failed", e) }
-                    }
-                }
-            }
-
-            // mark active recording and notify UI immediately to avoid races where system considers service not foreground
-            synchronized(this) {
-                currentRecording = recording
-                isRecordingFlag = true
-                startTime = System.currentTimeMillis()
-            }
-            // notify UI that recording started (best-effort)
-            try { sendLocalBroadcast(Intent(ACTION_RECORDING_STARTED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast started failed", e) }
-
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Exception during prepare/start recording", e)
-            // for better diagnostics on Android 15, include the stacktrace in a broadcast the Activity can surface
-            try {
-                val b = Intent(ACTION_NOTIFICATION_PERMISSION_REQUIRED)
-                b.putExtra("error", e.message)
-                sendLocalBroadcast(b)
-            } catch (_: Exception) {}
-            Toast.makeText(this, "録画の開始に失敗しました: ${e.message}", Toast.LENGTH_LONG).show()
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-            // clear flag when foreground stopped
-            try { isForegroundStarted = false } catch (_: Exception) {}
-            stopSelf()
-        }
-    }
-
-    private fun stopRecording() {
-        try {
-            // Ensure stopRecording runs on main thread because CameraX Recording.stop() must be called on main
-            if (Looper.getMainLooper().thread != Thread.currentThread()) {
-                ContextCompat.getMainExecutor(this).execute {
-                    stopRecording()
-                }
-                return
-            }
-
-            // Perform stop with defensive checks and exception handling
-            var hadRecording = false
-            synchronized(this) {
-                hadRecording = (currentRecording != null)
-            }
-
-            if (!hadRecording) {
-                Log.w("RecordingService", "stopRecording called but no active recording")
-                synchronized(this) {
-                    isRecordingFlag = false
-                    startTime = 0L
-                    currentRecording = null
-                }
-                try { sendLocalBroadcast(Intent(ACTION_RECORDING_STOPPED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast stopped failed", e) }
-                return
-            }
-
-            try {
-                // call stop and catch any runtime exceptions from CameraX
-                currentRecording?.stop()
-            } catch (e: Exception) {
-                Log.e("RecordingService", "error stopping recording", e)
-            } finally {
-                synchronized(this) {
-                    isRecordingFlag = false
-                    currentRecording = null
-                    startTime = 0L
-                }
-                try { sendLocalBroadcast(Intent(ACTION_RECORDING_STOPPED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast stopped failed", e) }
-            }
-        } catch (t: Throwable) {
-            // Catch everything to avoid crashing the service
-            Log.e("RecordingService", "fatal error in stopRecording", t)
-            try {
-                synchronized(this) {
-                    isRecordingFlag = false
-                    currentRecording = null
-                    startTime = 0L
-                }
-                try { sendLocalBroadcast(Intent(ACTION_RECORDING_STOPPED)) } catch (e: Exception) { Log.w("RecordingService", "sendBroadcast stopped failed", e) }
-            } catch (ignored: Exception) { /* ignore secondary errors */ }
-        }
-    }
-
-    fun getElapsedMs(): Long = if (isRecordingFlag && startTime > 0L) System.currentTimeMillis() - startTime else 0L
-
-    // New helper: allow clients to query whether service is currently recording
-    fun isRecording(): Boolean = isRecordingFlag
-
-    private fun buildNotification(text: String) =
-        NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(text)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setOngoing(true)
-            .apply {
-                // add stop action
-                val stopIntent = Intent(this@RecordingService, RecordingService::class.java).apply { action = ACTION_STOP }
-                val pStop = PendingIntent.getService(this@RecordingService, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-                addAction(android.R.drawable.ic_media_pause, "停止", pStop)
-            }
-            .build()
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = NotificationChannel(CHANNEL_ID, "録画", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "録画サービスの通知"
-            }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm?.createNotificationChannel(chan)
-        }
-    }
-
-    // Helper that forces broadcast to this app package to improve delivery reliability
-    private fun sendLocalBroadcast(intent: Intent) {
-        try {
-            intent.setPackage(packageName)
-            sendBroadcast(intent)
-        } catch (e: Exception) {
-            Log.w("RecordingService", "sendLocalBroadcast failed", e)
-        }
-    }
-
-    // Helper to send permission-required broadcast at most once per service instance
-    private fun sendPermissionBroadcastOnce(action: String, extras: Intent.() -> Unit = {}) {
-        try {
-            when (action) {
-                ACTION_NOTIFICATION_PERMISSION_REQUIRED -> {
-                    if (!notifPermissionBroadcastSent) {
-                        val i = Intent(action)
-                        i.extras()
-                        sendLocalBroadcast(i)
-                        notifPermissionBroadcastSent = true
-                        Log.i("RecordingService", "Sent ACTION_NOTIFICATION_PERMISSION_REQUIRED (once)")
-                    } else {
-                        Log.i("RecordingService", "Skipped duplicate ACTION_NOTIFICATION_PERMISSION_REQUIRED")
-                    }
-                }
-                ACTION_FOREGROUND_PERMISSION_REQUIRED -> {
-                    if (!fgsPermissionBroadcastSent) {
-                        val i = Intent(action)
-                        i.extras()
-                        sendLocalBroadcast(i)
-                        fgsPermissionBroadcastSent = true
-                        Log.i("RecordingService", "Sent ACTION_FOREGROUND_PERMISSION_REQUIRED (once)")
-                    } else {
-                        Log.i("RecordingService", "Skipped duplicate ACTION_FOREGROUND_PERMISSION_REQUIRED")
-                    }
-                }
-                ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED -> {
-                    if (!fgsPermissionBroadcastSent) {
-                        val i = Intent(action)
-                        i.extras()
-                        sendLocalBroadcast(i)
-                        fgsPermissionBroadcastSent = true
-                        Log.i("RecordingService", "Sent ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED (once)")
-                    } else {
-                        Log.i("RecordingService", "Skipped duplicate ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED")
-                    }
-                }
-                else -> {
-                    // fallback: send directly
-                    val i = Intent(action)
-                    i.extras()
-                    sendLocalBroadcast(i)
-                }
-            }
-        } catch (e: Exception) {
-            Log.w("RecordingService", "sendPermissionBroadcastOnce failed", e)
-        }
-    }
-
-     override fun onBind(intent: Intent?): IBinder {
-         return binder
-     }
-
-     override val lifecycle: Lifecycle
-         get() = lifecycleRegistry
-
-     override fun onDestroy() {
+    override fun onDestroy() {
         super.onDestroy()
-        try {
-            cameraProvider?.unbindAll()
-        } catch (e: Exception) {
-            Log.w("RecordingService", "onDestroy: unbindAll failed", e)
-        }
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-        bgExecutor.shutdownNow()
-     }
- }
+        stopRecording()
+        cameraExecutor.shutdown()
+    }
+
+    companion object {
+        const val ACTION_START = "com.example.silent.action.START_RECORDING"
+        const val ACTION_STOP = "com.example.silent.action.STOP_RECORDING"
+        const val ACTION_RECORDING_STARTED = "com.example.silent.action.RECORDING_STARTED"
+        const val ACTION_RECORDING_STOPPED = "com.example.silent.action.RECORDING_STOPPED"
+        const val ACTION_RECORDING_SAVED = "com.example.silent.action.RECORDING_SAVED"
+        const val ACTION_NOTIFICATION_PERMISSION_REQUIRED = "com.example.silent.action.NOTIFICATION_PERMISSION_REQUIRED"
+        const val ACTION_FOREGROUND_PERMISSION_REQUIRED = "com.example.silent.action.FOREGROUND_PERMISSION_REQUIRED"
+        const val ACTION_FOREGROUND_MIC_PERMISSION_REQUIRED = "com.example.silent.action.FOREGROUND_MIC_PERMISSION_REQUIRED"
+        const val ACTION_CAMERA_PERMISSION_REQUIRED = "com.example.silent.action.CAMERA_PERMISSION_REQUIRED"
+        const val ACTION_TIMER_START = "com.example.silent.action.TIMER_START"
+        const val ACTION_TIMER_CANCEL = "com.example.silent.action.TIMER_CANCEL"
+        const val ACTION_TIMER_TICK = "com.example.silent.action.TIMER_TICK"
+        const val ACTION_TIMER_STARTED = "com.example.silent.action.TIMER_STARTED"
+        const val ACTION_TIMER_CANCELLED = "com.example.silent.action.TIMER_CANCELLED"
+        const val ACTION_TOGGLE_CAMERA = "com.example.silent.action.TOGGLE_CAMERA"
+        const val ACTION_PREVIEW_UPDATED = "com.example.silent.action.PREVIEW_UPDATED"
+        const val EXTRA_CAMERA_LENS_FACING = "com.example.silent.extra.CAMERA_LENS_FACING"
+        private const val CHANNEL_ID = "recording_channel"
+        private const val TAG = "RecordingService"
+    }
+}
