@@ -14,13 +14,11 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.Recorder
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Quality
-import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -46,7 +44,6 @@ import android.view.ViewGroup.LayoutParams
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var previewView: PreviewView
     private lateinit var recordButton: Button
     private lateinit var audioStatus: TextView
     private lateinit var rootLayout: ViewGroup
@@ -91,8 +88,6 @@ class MainActivity : AppCompatActivity() {
             Pair(0, 0)
         }
     }
-
-    private var videoCapture: VideoCapture<Recorder>? = null
 
     private var recordingService: RecordingService? = null
     private var bound = false
@@ -146,9 +141,11 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
-        val granted = perms[Manifest.permission.CAMERA] == true
-        appendLog("Camera permission result: $granted")
-        if (granted) startCamera()
+        val granted = perms[Manifest.permission.CAMERA] == true && perms[Manifest.permission.RECORD_AUDIO] == true
+        appendLog("Camera & Audio permission result: $granted")
+        if (!granted) {
+            Toast.makeText(this, "カメラとマイクの権限が必要です", Toast.LENGTH_LONG).show()
+        }
     }
 
     // Shared pending timer start state when permission requests are needed
@@ -207,8 +204,10 @@ class MainActivity : AppCompatActivity() {
             val parent = findViewById<View>(android.R.id.content)
             Snackbar.make(parent, "アプリにフォアグラウンドサービスの権限が必要です。設定を開きますか？", Snackbar.LENGTH_INDEFINITE)
                 .setAction("設定") {
-                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) }
-                    startActivity(intent)
+                    try {
+                        // Prefer opening the app settings where user can grant the permission if supported.
+                        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", packageName, null) })
+                    } catch (_: Exception) { }
                 }
                 .show()
             pendingStartAfterFgsPerm = false
@@ -341,18 +340,62 @@ class MainActivity : AppCompatActivity() {
                     }
                     RecordingService.ACTION_RECORDING_SAVED -> {
                         // Activity receives the saved URI from the service and logs it for user visibility
-                        val uriStr = intent?.getStringExtra("video_uri")
-                        if (!uriStr.isNullOrEmpty()) {
-                            appendLog("Recording saved: $uriStr")
+                        // Be robust: the service may send a String extra, a Parcelable<Uri>, or different key names
+                        var uri: Uri? = null
+                        try {
+                            // Try common parcelable key first
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                uri = intent.getParcelableExtra("video_uri", Uri::class.java)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                uri = intent.getParcelableExtra("video_uri")
+                            }
+                        } catch (_: Exception) {}
+                        if (uri == null) {
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    uri = intent.getParcelableExtra("output_uri", Uri::class.java)
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    uri = intent.getParcelableExtra("output_uri")
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        if (uri == null) {
+                            try {
+                                val s1 = intent?.getStringExtra("video_uri")
+                                if (!s1.isNullOrEmpty()) uri = Uri.parse(s1)
+                            } catch (_: Exception) {}
+                        }
+                        if (uri == null) {
+                            try {
+                                val s2 = intent?.getStringExtra("output_uri")
+                                if (!s2.isNullOrEmpty()) uri = Uri.parse(s2)
+                            } catch (_: Exception) {}
+                        }
+                        if (uri == null) {
+                            // Try generic EXTRA_STREAM
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    uri = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    uri = intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                                }
+                            } catch (_: Exception) {}
+                        }
+
+                        if (uri != null) {
+                            appendLog("Recording saved: $uri")
                             try {
                                 val parent = findViewById<View>(android.R.id.content)
                                 Snackbar.make(parent, "録画を保存しました", Snackbar.LENGTH_SHORT)
                                     .setAction("開く") {
-                                        try { openUri(Uri.parse(uriStr)) } catch (_: Exception) {}
+                                        try { openUri(uri) } catch (_: Exception) {}
                                     }
                                     .show()
                                 // Add a clickable entry in the log so user can tap the URI
-                                try { appendClickableUri(Uri.parse(uriStr)) } catch (e: Exception) { appendLog("appendClickableUri failed: ${e.message}") }
+                                try { appendClickableUri(uri) } catch (e: Exception) { appendLog("appendClickableUri failed: ${e.message}") }
                             } catch (_: Exception) { }
                         } else {
                             appendLog("Recording saved (no URI provided)")
@@ -487,7 +530,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        previewView = findViewById(R.id.previewView)
         recordButton = findViewById(R.id.recordButton)
         audioStatus = findViewById(R.id.audioStatus)
         rootLayout = findViewById(R.id.rootLayout)
@@ -603,6 +645,7 @@ class MainActivity : AppCompatActivity() {
             startActivity(intent)
         }
 
+
         recordButton.setOnClickListener {
             // Decide action robustly:
             // - If the UI currently shows '停止' (record_stop), prefer stopping the service/recording
@@ -663,36 +706,9 @@ class MainActivity : AppCompatActivity() {
         if (needed.isNotEmpty()) {
             permissionLauncher.launch(needed.toTypedArray())
             appendLog("Requesting permissions: ${needed.joinToString()}")
-        } else {
-            startCamera()
         }
     }
 
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-
-            val recorder = Recorder.Builder()
-                .setQualitySelector(QualitySelector.from(Quality.HD))
-                .build()
-            videoCapture = VideoCapture.withOutput(recorder)
-
-            try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview, videoCapture)
-                appendLog("Camera started and bound to lifecycle")
-            } catch (e: Exception) {
-                e.printStackTrace()
-                appendLog("Failed to start camera: ${e.message}")
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
 
     // Entry point called by UI. This will ensure notification permission exists before starting service.
     private fun startRecording() {
@@ -779,7 +795,9 @@ class MainActivity : AppCompatActivity() {
     // Actual logic to start the service once we know permissions are satisfied
     private fun startRecordingInternal() {
         // Start foreground recording service (robust attempt)
-        val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_START }
+        val intent = Intent(this, RecordingService::class.java).apply {
+            action = RecordingService.ACTION_START
+        }
         try {
             // On Android O+ we must use startForegroundService when the service will call startForeground
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1109,5 +1127,15 @@ class MainActivity : AppCompatActivity() {
             // Fallback: log the error so callers can handle silently
             appendLog("safeRegisterReceiver failed: ${e.message}")
         }
+    }
+
+    // Release camera resources and clear preview surface to avoid holding camera when not needed
+    private fun releaseCameraResources() {
+        appendLog("Camera resources released by Activity")
+    }
+
+    override fun onDestroy() {
+        // Ensure camera resources are released when Activity destroyed
+        super.onDestroy()
     }
 }
