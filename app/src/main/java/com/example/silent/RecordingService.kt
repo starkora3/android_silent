@@ -4,6 +4,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.Build
@@ -50,6 +51,7 @@ import java.util.Date
 import java.util.concurrent.ExecutorService
 import android.content.pm.ServiceInfo
 import androidx.camera.video.Recording
+import android.os.PowerManager
 
 class RecordingService : LifecycleService() {
 
@@ -67,6 +69,7 @@ class RecordingService : LifecycleService() {
     private var timerJob: Job? = null
     private var timerDurationSec = 0
     private var timerStartSec = 0
+    private var wakeLock: PowerManager.WakeLock? = null
 
     // Preview update job
     private var previewUpdateJob: Job? = null
@@ -83,6 +86,20 @@ class RecordingService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         cameraExecutor = Executors.newSingleThreadExecutor()
+        createNotificationChannel()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "録画サービス"
+            val descriptionText = "録画中の通知を表示します"
+            val importance = NotificationManager.IMPORTANCE_LOW
+            val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+                description = descriptionText
+            }
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -318,6 +335,20 @@ class RecordingService : LifecycleService() {
         activeRecording = null
         isRecording = false
         recordingStartTime = 0L
+
+        // Release WakeLock if held
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(TAG, "WakeLock released on stopRecording")
+                }
+            }
+            wakeLock = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to release WakeLock on stopRecording", e)
+        }
+
         stopForeground(true)
         stopSelf()
         sendBroadcast(Intent(ACTION_RECORDING_STOPPED).setPackage(packageName))
@@ -338,6 +369,23 @@ class RecordingService : LifecycleService() {
         cancelTimer()
         timerStartSec = startSec
         timerDurationSec = durSec
+
+        // Start foreground notification immediately to keep service alive
+        startForegroundNotification("タイマー準備中...")
+
+        // Acquire WakeLock to prevent device from sleeping during timer recording
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "RecordingService::TimerWakeLock"
+            )
+            wakeLock?.acquire((startSec + durSec + 10) * 1000L) // Add 10 seconds buffer
+            Log.d(TAG, "WakeLock acquired for timer recording")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire WakeLock", e)
+        }
+
         timerJob = CoroutineScope(Dispatchers.Main).launch {
             // Countdown to start
             for (i in startSec downTo 1) {
@@ -347,7 +395,10 @@ class RecordingService : LifecycleService() {
                     setPackage(packageName)
                 }
                 sendBroadcast(intent)
-                startForegroundNotification("録画開始まで: $i 秒")
+                // Update notification only at significant intervals to reduce log spam
+                if (i == startSec || i <= 5 || i % 10 == 0) {
+                    startForegroundNotification("録画開始まで: $i 秒")
+                }
                 delay(1000)
             }
 
@@ -363,7 +414,10 @@ class RecordingService : LifecycleService() {
                     setPackage(packageName)
                 }
                 sendBroadcast(intent)
-                startForegroundNotification("録画中: 残り $i 秒")
+                // Update notification only at significant intervals to reduce log spam
+                if (i == durSec || i <= 10 || i % 30 == 0) {
+                    startForegroundNotification("録画中: 残り $i 秒")
+                }
                 delay(1000)
             }
 
@@ -375,6 +429,20 @@ class RecordingService : LifecycleService() {
     private fun cancelTimer() {
         timerJob?.cancel()
         timerJob = null
+
+        // Release WakeLock if held
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(TAG, "WakeLock released")
+                }
+            }
+            wakeLock = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to release WakeLock", e)
+        }
+
         stopForeground(true)
         sendBroadcast(Intent(ACTION_TIMER_CANCELLED).setPackage(packageName))
     }
@@ -384,6 +452,20 @@ class RecordingService : LifecycleService() {
 
     override fun onDestroy() {
         super.onDestroy()
+
+        // Release WakeLock if held
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(TAG, "WakeLock released on onDestroy")
+                }
+            }
+            wakeLock = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to release WakeLock on onDestroy", e)
+        }
+
         stopRecording()
         cameraExecutor.shutdown()
     }

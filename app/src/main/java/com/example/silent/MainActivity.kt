@@ -31,6 +31,7 @@ import android.widget.FrameLayout
 import androidx.coordinatorlayout.widget.CoordinatorLayout
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import android.Manifest
 import android.content.pm.PackageManager
 import android.text.SpannableString
@@ -113,6 +114,7 @@ class MainActivity : AppCompatActivity() {
     private var timerRemainingStartSec = 0
     private var timerRemainingRecSec = 0
     private var timerPhase = 0 // 0 = idle, 1 = waiting to start, 2 = recording countdown
+    private var screenKeepOnSet = false // Track if FLAG_KEEP_SCREEN_ON is currently set
 
     private val serviceConnection = object : android.content.ServiceConnection {
         override fun onServiceConnected(name: android.content.ComponentName, serviceIBinder: android.os.IBinder) {
@@ -344,6 +346,16 @@ class MainActivity : AppCompatActivity() {
                         recordingState.text = formatMs(0L)
                         recordingTimer.text = ""
                         appendLog("Recording stopped")
+                        // Allow screen to turn off again when recording stops
+                        if (screenKeepOnSet) {
+                            try {
+                                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                                screenKeepOnSet = false
+                                appendLog("Screen can turn off now")
+                            } catch (e: Exception) {
+                                appendLog("Failed to clear FLAG_KEEP_SCREEN_ON: ${e.message}")
+                            }
+                        }
                     }
                     RecordingService.ACTION_RECORDING_SAVED -> {
                         // Activity receives the saved URI from the service and logs it for user visibility
@@ -1120,6 +1132,16 @@ class MainActivity : AppCompatActivity() {
         timerPhase = 0
         // restore button label when timer is cancelled
         try { timerRecordButton?.text = timerButtonOriginalText } catch (e: Exception) { /* ignore */ }
+        // Allow screen to turn off again
+        if (screenKeepOnSet) {
+            try {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                screenKeepOnSet = false
+                appendLog("Screen can turn off now (timer cancelled)")
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
         try {
             val intent = Intent(this, RecordingService::class.java).apply { action = RecordingService.ACTION_TIMER_CANCEL }
             // Use startService for cancel to avoid triggering foreground start without explicit user action
@@ -1150,6 +1172,16 @@ class MainActivity : AppCompatActivity() {
                                 recordingTimer.text = String.format("開始まで: %02d:%02d", remainingSec / 60, remainingSec % 60)
                                 // Ensure timer button shows 'キャンセル' while waiting (service-driven start)
                                 try { timerRecordButton?.text = "キャンセル" } catch (_: Exception) {}
+                                // Keep screen on during timer countdown - only log once
+                                if (!screenKeepOnSet) {
+                                    try {
+                                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                                        screenKeepOnSet = true
+                                        appendLog("Screen will stay on during timer")
+                                    } catch (e: Exception) {
+                                        appendLog("Failed to set FLAG_KEEP_SCREEN_ON: ${e.message}")
+                                    }
+                                }
                             }
                             "recording" -> {
                                 timerPhase = 2
@@ -1177,6 +1209,16 @@ class MainActivity : AppCompatActivity() {
                         timerPhase = 0
                         // restore button label when timer is cancelled
                         try { timerRecordButton?.text = timerButtonOriginalText } catch (e: Exception) { /* ignore */ }
+                        // Allow screen to turn off again
+                        if (screenKeepOnSet) {
+                            try {
+                                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                                screenKeepOnSet = false
+                                appendLog("Screen can turn off now")
+                            } catch (e: Exception) {
+                                appendLog("Failed to clear FLAG_KEEP_SCREEN_ON: ${e.message}")
+                            }
+                        }
                     }
                 }
             }
@@ -1205,6 +1247,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         // Ensure camera resources are released when Activity destroyed
+        // Clear screen keep-on flag if it's still set
+        try {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            screenKeepOnSet = false
+        } catch (e: Exception) {
+            // ignore
+        }
         super.onDestroy()
     }
 }

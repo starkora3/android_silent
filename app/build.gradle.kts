@@ -11,7 +11,7 @@ android {
     defaultConfig {
         applicationId = "com.example.silent"
         // Lower minSdk so the app can run on more real devices (CameraX requires API 21+)
-        minSdk = 31
+        minSdk = 28
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
