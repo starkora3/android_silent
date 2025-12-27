@@ -145,6 +145,7 @@
                 android:layout_weight="1"
                 android:hint="開始秒 (例:10)"
                 android:inputType="number"
+                android:textColor="@color/black"
                 android:padding="8dp" />
 
             <EditText
@@ -154,6 +155,7 @@
                 android:layout_weight="1"
                 android:hint="録画秒数 (例:30)"
                 android:inputType="number"
+                android:textColor="@color/black"
                 android:padding="8dp"
                 android:layout_marginStart="8dp" />
 
