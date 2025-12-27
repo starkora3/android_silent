@@ -30,6 +30,15 @@ import android.Manifest
 import java.util.concurrent.Executors
 import android.os.Handler
 import android.os.Looper
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import java.io.FileOutputStream
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.graphics.Rect
+import android.graphics.YuvImage
+import java.io.ByteArrayOutputStream
 import androidx.camera.core.Camera
 import androidx.camera.video.VideoRecordEvent
 import androidx.core.app.ActivityCompat
@@ -56,7 +65,9 @@ class RecordingService : LifecycleService() {
     private var isRecording = false
     private var recordingStartTime: Long = 0L
     private var videoCapture: VideoCapture<Recorder>? = null
+    private var imageAnalysis: ImageAnalysis? = null
     private var activeRecording: Recording? = null
+    private var cameraReady = false
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
     private lateinit var cameraExecutor: ExecutorService
@@ -181,7 +192,8 @@ class RecordingService : LifecycleService() {
         }
     }
 
-    private fun setupVideoCapture(lensFacing: Int) {
+    private fun setupCamera(lensFacing: Int) {
+        cameraReady = false
         currentCameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
@@ -190,35 +202,111 @@ class RecordingService : LifecycleService() {
                 .setQualitySelector(QualitySelector.from(Quality.HD))
                 .build()
             videoCapture = VideoCapture.withOutput(recorder)
+
+            imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            imageAnalysis?.setAnalyzer(cameraExecutor, ImageAnalysis.Analyzer { imageProxy ->
+                if (!isRecording) {
+                    imageProxy.close()
+                    return@Analyzer
+                }
+                // 1秒に1回程度の頻度で画像を処理
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastPreviewUpdateTime > 1000) {
+                    lastPreviewUpdateTime = currentTime
+                    processImage(imageProxy)
+                }
+                imageProxy.close()
+            })
+
             try {
                 cameraProvider?.unbindAll()
-                cameraProvider?.bindToLifecycle(this, currentCameraSelector, videoCapture)
+                cameraProvider?.bindToLifecycle(this, currentCameraSelector, videoCapture, imageAnalysis)
+                cameraReady = true
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to bind camera", e)
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private var lastPreviewUpdateTime = 0L
+
+    private fun processImage(imageProxy: ImageProxy) {
+        val bitmap = toBitmapFromYuv(imageProxy)
+        if (bitmap != null) {
+            // 画像を回転させる
+            val matrix = Matrix().apply {
+                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            }
+            val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+
+            // ファイルに保存
+            val file = File(cacheDir, "preview.jpg")
+            try {
+                FileOutputStream(file).use { out ->
+                    rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                }
+                // MainActivityに通知
+                val intent = Intent(ACTION_PREVIEW_UPDATED).apply {
+                    putExtra("preview_path", file.absolutePath)
+                    setPackage(packageName)
+                }
+                sendBroadcast(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save preview image", e)
+            }
+        }
+    }
+
+    private fun toBitmapFromYuv(imageProxy: ImageProxy): Bitmap? {
+        if (imageProxy.format != android.graphics.ImageFormat.YUV_420_888) {
+            Log.e(TAG, "Unsupported image format: ${imageProxy.format}")
+            return null
+        }
+
+        val yBuffer = imageProxy.planes[0].buffer.apply { rewind() }
+        val uBuffer = imageProxy.planes[1].buffer.apply { rewind() }
+        val vBuffer = imageProxy.planes[2].buffer.apply { rewind() }
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+
+        // U and V are swapped in NV21 format compared to I420 format
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+
+        val yuvImage = YuvImage(nv21, android.graphics.ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 80, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+
     private fun startRecording(lensFacing: Int) {
         // First, ensure camera is set up with the correct lens facing
-        setupVideoCapture(lensFacing)
+        setupCamera(lensFacing)
 
-         val vc = videoCapture
-        if (vc == null) {
-            // This can happen if camera initialization is slow. Retry after a short delay.
-            lifecycleScope.launch {
-                delay(500)
-                val delayedVc = videoCapture
-                if (delayedVc != null) {
-                    startRecordingInternal(delayedVc)
-                } else {
-                    Log.e(TAG, "VideoCapture is still null after delay.")
-                    Toast.makeText(applicationContext, "カメラの初期化に失敗しました", Toast.LENGTH_SHORT).show()
-                }
+        // Wait for camera to be ready
+        lifecycleScope.launch {
+            while (!cameraReady) {
+                delay(100)
             }
-            return
+            // Now start the actual recording
+            val vc = videoCapture
+            if (vc != null) {
+                startRecordingInternal(vc)
+            } else {
+                Log.e(TAG, "VideoCapture is null after camera is ready.")
+                Toast.makeText(applicationContext, "カメラの初期化に失敗しました", Toast.LENGTH_SHORT).show()
+            }
         }
-        startRecordingInternal(vc)
     }
 
     private fun startRecordingInternal(vc: VideoCapture<Recorder>) {
@@ -278,7 +366,6 @@ class RecordingService : LifecycleService() {
         stopForeground(true)
         stopSelf()
         sendBroadcast(Intent(ACTION_RECORDING_STOPPED).setPackage(packageName))
-        // Release camera resources
         cameraProvider?.unbindAll()
     }
 
@@ -292,7 +379,7 @@ class RecordingService : LifecycleService() {
             cameraProvider?.unbindAll()
 
             // Set up the new camera
-            setupVideoCapture(lensFacing)
+            setupCamera(lensFacing)
 
             // Start a new recording after a short delay to allow the camera to re-initialize
             lifecycleScope.launch {
@@ -306,7 +393,7 @@ class RecordingService : LifecycleService() {
             }
         } else {
             // If not recording, just update the selector for the next recording
-            setupVideoCapture(lensFacing)
+            setupCamera(lensFacing)
         }
     }
 
@@ -380,6 +467,7 @@ class RecordingService : LifecycleService() {
         const val ACTION_TIMER_STARTED = "com.example.silent.action.TIMER_STARTED"
         const val ACTION_TIMER_CANCELLED = "com.example.silent.action.TIMER_CANCELLED"
         const val ACTION_TOGGLE_CAMERA = "com.example.silent.action.TOGGLE_CAMERA"
+        const val ACTION_PREVIEW_UPDATED = "com.example.silent.action.PREVIEW_UPDATED"
         const val EXTRA_CAMERA_LENS_FACING = "com.example.silent.extra.CAMERA_LENS_FACING"
         private const val CHANNEL_ID = "recording_channel"
         private const val TAG = "RecordingService"

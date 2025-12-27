@@ -53,6 +53,7 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.video)
     implementation(libs.androidx.camera.view)
+    implementation("androidx.camera:camera-core:1.3.4")
 
     // RecyclerView
     implementation(libs.androidx.recyclerview)
