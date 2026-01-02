@@ -1263,6 +1263,20 @@ class MainActivity : AppCompatActivity() {
         appendLog("Camera resources released by Activity")
     }
 
+    override fun onResume() {
+        super.onResume()
+        // アプリがフォアグラウンドになったことをサービスに通知
+        recordingService?.setAppInForeground(true)
+        appendLog("App resumed (foreground)")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // アプリがバックグラウンドになったことをサービスに通知
+        recordingService?.setAppInForeground(false)
+        appendLog("App paused (background)")
+    }
+
     override fun onDestroy() {
         // Ensure camera resources are released when Activity destroyed
         // Clear screen keep-on flag if it's still set

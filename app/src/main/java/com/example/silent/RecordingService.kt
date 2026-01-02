@@ -98,6 +98,14 @@ class RecordingService : Service() {
     // Preview update job
     private var previewUpdateJob: Job? = null
 
+    // 録画ファイル分割用
+    private var fileSplitJob: Job? = null
+    private val SPLIT_INTERVAL_SECONDS = 15  // ファイル分割間隔（秒）
+    private val STATUS_LOG_INTERVAL_SECONDS = SPLIT_INTERVAL_SECONDS  // 録画ステータスログ出力間隔（秒）
+    private val TIMER_NOTIFICATION_INTERVAL_SECONDS = SPLIT_INTERVAL_SECONDS  // タイマー通知更新間隔（秒）
+    private var isSplittingFile = false
+    private var isAppInForeground = true
+
     inner class LocalBinder : Binder() {
         fun getService(): RecordingService = this@RecordingService
     }
@@ -332,6 +340,7 @@ class RecordingService : Service() {
             return
         }
 
+        val interval  = SPLIT_INTERVAL_SECONDS
         activeRecording = vc.output
             .prepareRecording(this, mediaStoreOutput)
             .withAudioEnabled()
@@ -344,14 +353,16 @@ class RecordingService : Service() {
                     is VideoRecordEvent.Status -> {
                         // 定期的な録画状態の更新（フレーム数などを確認）
                         val recordedDuration = event.recordingStats.recordedDurationNanos / 1_000_000_000
-                        if (recordedDuration > 0 && recordedDuration % 10 == 0L) {
+                        if (recordedDuration > 0 && recordedDuration % interval == 0L) {
                             Log.d(TAG, "Recording status: ${recordedDuration}s, bytes: ${event.recordingStats.numBytesRecorded}")
+                            sendLogToUI("録画中: ${recordedDuration}秒経過")
                         }
                     }
                     is VideoRecordEvent.Finalize -> {
                         if (!event.hasError()) {
                             val uri = event.outputResults.outputUri
                             Log.i(TAG, "Recording finalized successfully: $uri")
+                            sendLogToUI("録画完了: ${uri.lastPathSegment}")
                             val intent = Intent(ACTION_RECORDING_SAVED).apply {
                                 putExtra("video_uri", uri)
                                 setPackage(packageName)
@@ -359,18 +370,154 @@ class RecordingService : Service() {
                             sendBroadcast(intent)
                         } else {
                             Log.e(TAG, "Video recording failed: Error: ${event.error}, Cause: ${event.cause?.message}")
+                            sendLogToUI("録画エラー: ${event.error}")
                         }
-                        stopRecording()
+
+                        // ファイル分割中でなければ録画を停止
+                        if (!isSplittingFile) {
+                            Log.i(TAG, "Stopping recording (not splitting)")
+                            stopRecording()
+                        } else {
+                            // ファイル分割中 - 録画は継続、activeRecordingはrestartRecordingで再設定される
+                            Log.d(TAG, "File splitting in progress, not stopping recording")
+                            sendLogToUI("ファイル分割中、録画継続")
+                            activeRecording = null  // 次のrestartRecordingで新しいactiveRecordingが設定される
+                        }
                     }
                 }
             }
         Log.i(TAG, "Recording started successfully")
+
+        // フォアグラウンドの場合のみファイル分割タイマーを開始
+        if (isAppInForeground) {
+            startFileSplitTimer()
+        }
+    }
+
+    // 30秒ごとに録画ファイルを分割（フォアグラウンド時のみ）
+    private fun startFileSplitTimer() {
+        fileSplitJob?.cancel()
+        fileSplitJob = serviceScope.launch {
+            while (isRecording && isAppInForeground) {
+                delay(SPLIT_INTERVAL_SECONDS * 1000L)
+
+                if (isRecording && isAppInForeground) {
+                    Log.i(TAG, "========================================")
+                    sendLogToUI("${SPLIT_INTERVAL_SECONDS}秒経過: 録画ファイルを分割します")
+
+                    // ファイル分割フラグをセット
+                    isSplittingFile = true
+
+                    // 現在の録画を停止（これによりファイルが保存される）
+                    // activeRecordingはnullにせず、Finalizeイベントで処理される
+                    activeRecording?.stop()
+
+                    // Finalizeイベントと新しい録画開始を待つ
+                    delay(1000)
+                    sendLogToUI("録画を再開します")
+
+                    // 新しい録画を開始
+                    val vc = videoCapture
+                    if (vc != null && isRecording && isAppInForeground) {
+                        Log.i(TAG, "新しい録画ファイルを開始します")
+                        restartRecording(vc)
+                        // 少し待って録画が開始されるのを確認
+                        delay(500)
+                        Log.i(TAG, "次の分割タイマーを継続します")
+                    } else {
+                        Log.w(TAG, "録画の再開をスキップ (videoCapture=$vc, isRecording=$isRecording, foreground=$isAppInForeground)")
+                        isSplittingFile = false
+                        break
+                    }
+
+                    Log.i(TAG, "========================================")
+                }
+            }
+            Log.d(TAG, "File split timer ended")
+        }
+        Log.d(TAG, "File split timer started (${SPLIT_INTERVAL_SECONDS}s interval)")
+    }
+
+    // 録画を再開（ファイル分割用）
+    private fun restartRecording(vc: VideoCapture<Recorder>) {
+        val name = "video_${System.currentTimeMillis()}.mp4"
+        Log.i(TAG, "Recording to new file: $name")
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+        }
+        val mediaStoreOutput = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            .setContentValues(contentValues)
+            .build()
+
+        val interval = STATUS_LOG_INTERVAL_SECONDS
+        activeRecording = vc.output
+            .prepareRecording(this, mediaStoreOutput)
+            .withAudioEnabled()
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        Log.i(TAG, "VideoRecordEvent.Start received - new file recording active")
+                        sendLogToUI("新ファイル録画開始")
+                    }
+                    is VideoRecordEvent.Status -> {
+                        val recordedDuration = event.recordingStats.recordedDurationNanos / 1_000_000_000
+                        if (recordedDuration > 0 && recordedDuration % interval == 0L) {
+                            Log.d(TAG, "Split recording status: ${recordedDuration}s, bytes: ${event.recordingStats.numBytesRecorded}")
+                        }
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        if (!event.hasError()) {
+                            val uri = event.outputResults.outputUri
+                            Log.i(TAG, "Split file finalized successfully: $uri")
+                            sendLogToUI("分割ファイル保存完了: ${uri.lastPathSegment}")
+                            val intent = Intent(ACTION_RECORDING_SAVED).apply {
+                                putExtra("video_uri", uri)
+                                setPackage(packageName)
+                            }
+                            sendBroadcast(intent)
+                        } else {
+                            Log.e(TAG, "Split recording failed: Error: ${event.error}, Cause: ${event.cause?.message}")
+                            sendLogToUI("分割録画エラー: ${event.error}")
+                        }
+
+                        // ファイル分割中でなければ録画を停止
+                        if (!isSplittingFile) {
+                            Log.i(TAG, "Stopping recording (split finished, not continuing)")
+                            stopRecording()
+                        } else {
+                            // ファイル分割完了 - 次の録画が既に開始されている
+                            Log.d(TAG, "File split completed, recording continues")
+                            sendLogToUI("ファイル分割完了、録画継続")
+                            isSplittingFile = false
+                            activeRecording = null  // 古いactiveRecordingをクリア
+                        }
+                    }
+                }
+            }
+    }
+
+    // 画面ログに送信するヘルパー関数
+    private fun sendLogToUI(message: String) {
+        try {
+            val intent = Intent(ACTION_LOG_MESSAGE).apply {
+                putExtra("log_message", message)
+                setPackage(packageName)
+            }
+            sendBroadcast(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send log to UI", e)
+        }
     }
 
     private fun stopRecording() {
         Log.i(TAG, "stopRecording called", Exception("Stack trace"))
+        sendLogToUI("録画停止")
         previewUpdateJob?.cancel()
         previewUpdateJob = null
+        fileSplitJob?.cancel()
+        fileSplitJob = null
+        isSplittingFile = false
         activeRecording?.stop()
         activeRecording = null
         isRecording = false
@@ -455,7 +602,7 @@ class RecordingService : Service() {
                 }
                 sendBroadcast(intent)
                 // Update notification only at significant intervals to reduce log spam
-                if (i == durSec || i <= 10 || i % 30 == 0) {
+                if (i == durSec || i <= 10 || i % TIMER_NOTIFICATION_INTERVAL_SECONDS == 0) {
                     startForegroundNotification("録画中: 残り $i 秒")
                 }
                 delay(1000)
@@ -489,6 +636,23 @@ class RecordingService : Service() {
 
     fun isRecording(): Boolean = isRecording
     fun getElapsedMs(): Long = if (isRecording) System.currentTimeMillis() - recordingStartTime else 0L
+
+    // アプリがフォアグラウンドかどうかを設定（MainActivityから呼ばれる）
+    fun setAppInForeground(inForeground: Boolean) {
+        isAppInForeground = inForeground
+        Log.d(TAG, "App foreground state: $inForeground")
+
+        // フォアグラウンドに戻ったら、録画中なら分割タイマーを再開
+        if (inForeground && isRecording && fileSplitJob == null) {
+            startFileSplitTimer()
+        }
+        // バックグラウンドに移行したら分割タイマーを停止
+        if (!inForeground) {
+            fileSplitJob?.cancel()
+            fileSplitJob = null
+            Log.d(TAG, "File split timer stopped (background)")
+        }
+    }
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy called")
