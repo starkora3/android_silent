@@ -44,6 +44,7 @@ import android.text.InputType
 import android.widget.LinearLayout
 import android.view.ViewGroup.LayoutParams
 import android.graphics.BitmapFactory
+import android.util.Log
 
 class MainActivity : AppCompatActivity() {
 
@@ -119,6 +120,7 @@ class MainActivity : AppCompatActivity() {
     private var timerRemainingRecSec = 0
     private var timerPhase = 0 // 0 = idle, 1 = waiting to start, 2 = recording countdown
     private var screenKeepOnSet = false // Track if FLAG_KEEP_SCREEN_ON is currently set
+    private var originalBrightness: Float = -1f // 元の画面輝度を保存
 
     private val serviceConnection = object : android.content.ServiceConnection {
         override fun onServiceConnected(name: android.content.ComponentName, serviceIBinder: android.os.IBinder) {
@@ -355,6 +357,14 @@ class MainActivity : AppCompatActivity() {
                         recordingState.text = formatMs(0L)
                         recordingTimer.text = ""
                         appendLog("Recording stopped")
+
+                        // タイマー録画が終了した場合はタイマーUIもリセット
+                        if (timerPhase > 0) {
+                            timerPhase = 0
+                            try { timerRecordButton?.text = timerButtonOriginalText } catch (_: Exception) {}
+                            appendLog("タイマー録画が終了しました")
+                        }
+
                         // Allow screen to turn off again when recording stops
                         if (screenKeepOnSet) {
                             try {
@@ -365,6 +375,8 @@ class MainActivity : AppCompatActivity() {
                                 appendLog("Failed to clear FLAG_KEEP_SCREEN_ON: ${e.message}")
                             }
                         }
+                        // 画面輝度を復元（タイマー録画終了時も含む）
+                        restoreBrightness()
                     }
                     RecordingService.ACTION_RECORDING_SAVED -> {
                         // Activity receives the saved URI from the service and logs it for user visibility
@@ -639,7 +651,7 @@ class MainActivity : AppCompatActivity() {
                 splitIntervalInput?.setText(service.splitInterval.toString())
             } ?: run {
                 // サービス未接続時はデフォルト値を表示
-                splitIntervalInput?.setText(600.toString())
+                splitIntervalInput?.setText(RecordingService.DEFAULT_SPLIT_INTERVAL.toString())
             }
 
             setSplitIntervalButton?.setOnClickListener {
@@ -661,7 +673,7 @@ class MainActivity : AppCompatActivity() {
 
             timerRecordButton?.setOnClickListener {
                 try {
-                    appendLog("timerRecordButton clicked: phase=$timerPhase, buttonExists=${timerRecordButton != null}")
+                    appendLog("タイマー開始: phase=$timerPhase, buttonExists=${timerRecordButton != null}")
                     // If a timer is already running, treat this click as CANCEL
                     if (timerPhase != 0) {
                         cancelTimerCountdown()
@@ -669,6 +681,8 @@ class MainActivity : AppCompatActivity() {
                         // restore on UI thread
                         runOnUiThread { timerRecordButton?.text = timerButtonOriginalText }
                         appendLog("タイマー録画をキャンセルしました")
+                        // 画面輝度を復元
+                        restoreBrightness()
                         return@setOnClickListener
                     }
 
@@ -682,6 +696,9 @@ class MainActivity : AppCompatActivity() {
 
                     // Ensure we remembered original text
                     if (timerButtonOriginalText == null) timerButtonOriginalText = timerRecordButton?.text
+
+                    // 画面輝度を最低にする（タイマー録画ボタン押下時）
+                    setMinimumBrightness()
 
                     // Immediately update button label so UI reflects the started timer (on UI thread)
                     try {
@@ -1275,6 +1292,7 @@ class MainActivity : AppCompatActivity() {
                                 appendLog("Failed to clear FLAG_KEEP_SCREEN_ON: ${e.message}")
                             }
                         }
+                        // 画面輝度の復元はボタン押下時に既に実行済み
                     }
                 }
             }
@@ -1299,6 +1317,44 @@ class MainActivity : AppCompatActivity() {
     // Release camera resources and clear preview surface to avoid holding camera when not needed
     private fun releaseCameraResources() {
         appendLog("Camera resources released by Activity")
+    }
+
+    // 画面輝度を最低にする
+    private fun setMinimumBrightness() {
+        try {
+            val layoutParams = window.attributes
+            originalBrightness = layoutParams.screenBrightness
+            if(originalBrightness<0)originalBrightness=0.3f
+            layoutParams.screenBrightness = 0.01f // 最低輝度（完全な0だと自動輝度になる可能性があるため0.01）
+            window.attributes = layoutParams
+            appendLog("画面輝度を最低に設定しました ${originalBrightness} -> 0.01")
+            Log.d("MainActivity", "Screen brightness set to minimum (saved original: $originalBrightness)")
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to set minimum brightness", e)
+            appendLog("輝度設定エラー: ${e.message}")
+        }
+    }
+
+    // 画面輝度を元に戻す
+    private fun restoreBrightness() {
+        // 既に復元済み、または輝度変更していない場合は何もしない
+        if (originalBrightness < 0) {
+            appendLog("輝度復元済み")
+            Log.d("MainActivity", "Brightness already restored or not set, skipping")
+            return
+        }
+
+        try {
+            val layoutParams = window.attributes
+            layoutParams.screenBrightness = originalBrightness
+            window.attributes = layoutParams
+            appendLog("画面輝度を復元しました")
+            Log.d("MainActivity", "Screen brightness restored to: $originalBrightness")
+            originalBrightness = -1f
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to restore brightness", e)
+            appendLog("輝度復元エラー: ${e.message}")
+        }
     }
 
     override fun onResume() {

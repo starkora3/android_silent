@@ -107,8 +107,21 @@ class RecordingService : Service() {
     var splitInterval: Int
         get() = _splitInterval
         set(value){
-            _splitInterval = if(value>=5 && value<=60) value else 60
+            val newValue = if(value>=5 && value<=600) value else 60
+            _splitInterval = newValue
+            // SharedPreferencesに保存
+            saveSplitInterval(newValue)
+            Log.d(TAG, "Split interval set to: $newValue seconds")
         }
+
+    private fun saveSplitInterval(seconds: Int) {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit().putInt(PREF_SPLIT_INTERVAL, seconds).apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save split interval", e)
+        }
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): RecordingService = this@RecordingService
@@ -123,6 +136,22 @@ class RecordingService : Service() {
         super.onCreate()
         cameraExecutor = Executors.newSingleThreadExecutor()
         createNotificationChannel()
+
+        // SharedPreferencesから分割間隔を読み込む
+        loadSplitInterval()
+        Log.d(TAG, "RecordingService created, split interval: $_splitInterval seconds")
+    }
+
+    private fun loadSplitInterval() {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            _splitInterval = prefs.getInt(PREF_SPLIT_INTERVAL, DEFAULT_SPLIT_INTERVAL)
+            Log.d(TAG, "Split interval loaded from SharedPreferences: $_splitInterval seconds")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load split interval", e)
+            _splitInterval = DEFAULT_SPLIT_INTERVAL
+            Log.d(TAG, "Using default split interval: $_splitInterval seconds")
+        }
     }
 
     private fun createNotificationChannel() {
@@ -515,17 +544,29 @@ class RecordingService : Service() {
     }
 
     private fun stopRecording() {
-        Log.i(TAG, "stopRecording called", Exception("Stack trace"))
+        Log.i(TAG, "stopRecording called - isSplittingFile=$isSplittingFile", Exception("Stack trace"))
         sendLogToUI("録画停止")
         previewUpdateJob?.cancel()
         previewUpdateJob = null
-        fileSplitJob?.cancel()
-        fileSplitJob = null
-        isSplittingFile = false
+
+        // ファイル分割中でなければタイマーをキャンセル
+        if (!isSplittingFile) {
+            fileSplitJob?.cancel()
+            fileSplitJob = null
+            Log.d(TAG, "File split job cancelled (not splitting)")
+        } else {
+            Log.d(TAG, "File split job NOT cancelled (splitting in progress)")
+        }
+
         activeRecording?.stop()
         activeRecording = null
         isRecording = false
         recordingStartTime = 0L
+
+        // ファイル分割中でなければフラグをリセット
+        if (!isSplittingFile) {
+            isSplittingFile = false
+        }
 
         // Release WakeLock if held
         try {
@@ -542,7 +583,15 @@ class RecordingService : Service() {
 
         stopForeground(true)
         stopSelf()
-        sendBroadcast(Intent(ACTION_RECORDING_STOPPED).setPackage(packageName))
+
+        // ファイル分割中でなければACTION_RECORDING_STOPPEDを送信
+        if (!isSplittingFile) {
+            sendBroadcast(Intent(ACTION_RECORDING_STOPPED).setPackage(packageName))
+            Log.d(TAG, "ACTION_RECORDING_STOPPED broadcast sent")
+        } else {
+            Log.d(TAG, "Skipping ACTION_RECORDING_STOPPED (file splitting in progress)")
+        }
+
         cameraProvider?.unbindAll()
     }
 
