@@ -37,13 +37,13 @@ import androidx.core.app.ActivityCompat
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import java.io.FileOutputStream
-import androidx.lifecycle.LifecycleService
-import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -53,7 +53,31 @@ import android.content.pm.ServiceInfo
 import androidx.camera.video.Recording
 import android.os.PowerManager
 
-class RecordingService : LifecycleService() {
+class RecordingService : Service() {
+
+    // サービス独自のCoroutineScope（アプリのライフサイクルに依存しない）
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    // バックグラウンドでもカメラを動作させるためのカスタムLifecycleOwner
+    private val cameraLifecycleOwner = object : LifecycleOwner {
+        private val lifecycleRegistry = LifecycleRegistry(this)
+
+        init {
+            lifecycleRegistry.currentState = Lifecycle.State.INITIALIZED
+            lifecycleRegistry.currentState = Lifecycle.State.CREATED
+            lifecycleRegistry.currentState = Lifecycle.State.STARTED
+            lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+            Log.d(TAG, "CameraLifecycleOwner initialized - always RESUMED")
+        }
+
+        override val lifecycle: Lifecycle
+            get() = lifecycleRegistry
+
+        fun destroy() {
+            lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+            Log.d(TAG, "CameraLifecycleOwner destroyed")
+        }
+    }
 
     private val binder = LocalBinder()
     private var isRecording = false
@@ -79,7 +103,7 @@ class RecordingService : LifecycleService() {
     }
 
     override fun onBind(intent: Intent): IBinder {
-        super.onBind(intent)
+        Log.d(TAG, "onBind called")
         return binder
     }
 
@@ -222,7 +246,8 @@ class RecordingService : LifecycleService() {
                     .build()
 
                 cameraProvider?.unbindAll()
-                cameraProvider?.bindToLifecycle(this, currentCameraSelector, videoCapture, imageCapture)
+                // カスタムLifecycleOwnerを使用してバックグラウンドでもカメラを動作させる
+                cameraProvider?.bindToLifecycle(cameraLifecycleOwner, currentCameraSelector, videoCapture, imageCapture)
 
                 val vc = videoCapture
                 if (vc != null) {
@@ -241,12 +266,13 @@ class RecordingService : LifecycleService() {
 
     private fun startPreviewCapture() {
         previewUpdateJob?.cancel()
-        previewUpdateJob = lifecycleScope.launch {
+        previewUpdateJob = serviceScope.launch {
             while (isRecording) {
                 capturePreviewImage()
                 delay(1000) // 1秒ごとにキャプチャ
             }
         }
+        Log.d(TAG, "Preview capture started with serviceScope")
     }
 
     private fun capturePreviewImage() {
@@ -284,9 +310,12 @@ class RecordingService : LifecycleService() {
         isRecording = true
         recordingStartTime = System.currentTimeMillis()
 
+        Log.i(TAG, "Starting video recording - CameraLifecycle: ${cameraLifecycleOwner.lifecycle.currentState}")
+
         startForegroundNotification("録画を開始しました")
 
         val name = "video_${System.currentTimeMillis()}.mp4"
+        Log.i(TAG, "Recording to file: $name")
         val contentValues = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, name)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -309,11 +338,20 @@ class RecordingService : LifecycleService() {
             .start(ContextCompat.getMainExecutor(this)) { event ->
                 when (event) {
                     is VideoRecordEvent.Start -> {
+                        Log.i(TAG, "VideoRecordEvent.Start received - recording active")
                         sendBroadcast(Intent(ACTION_RECORDING_STARTED).setPackage(packageName))
+                    }
+                    is VideoRecordEvent.Status -> {
+                        // 定期的な録画状態の更新（フレーム数などを確認）
+                        val recordedDuration = event.recordingStats.recordedDurationNanos / 1_000_000_000
+                        if (recordedDuration > 0 && recordedDuration % 10 == 0L) {
+                            Log.d(TAG, "Recording status: ${recordedDuration}s, bytes: ${event.recordingStats.numBytesRecorded}")
+                        }
                     }
                     is VideoRecordEvent.Finalize -> {
                         if (!event.hasError()) {
                             val uri = event.outputResults.outputUri
+                            Log.i(TAG, "Recording finalized successfully: $uri")
                             val intent = Intent(ACTION_RECORDING_SAVED).apply {
                                 putExtra("video_uri", uri)
                                 setPackage(packageName)
@@ -326,9 +364,11 @@ class RecordingService : LifecycleService() {
                     }
                 }
             }
+        Log.i(TAG, "Recording started successfully")
     }
 
     private fun stopRecording() {
+        Log.i(TAG, "stopRecording called", Exception("Stack trace"))
         previewUpdateJob?.cancel()
         previewUpdateJob = null
         activeRecording?.stop()
@@ -451,7 +491,7 @@ class RecordingService : LifecycleService() {
     fun getElapsedMs(): Long = if (isRecording) System.currentTimeMillis() - recordingStartTime else 0L
 
     override fun onDestroy() {
-        super.onDestroy()
+        Log.i(TAG, "onDestroy called")
 
         // Release WakeLock if held
         try {
@@ -468,6 +508,13 @@ class RecordingService : LifecycleService() {
 
         stopRecording()
         cameraExecutor.shutdown()
+
+        // カスタムLifecycleOwnerを破棄
+        cameraLifecycleOwner.destroy()
+
+        // サービススコープをキャンセル
+        serviceScope.cancel()
+        Log.i(TAG, "Service destroyed completely")
     }
 
     companion object {
@@ -487,6 +534,7 @@ class RecordingService : LifecycleService() {
         const val ACTION_TIMER_CANCELLED = "com.example.silent.action.TIMER_CANCELLED"
         const val ACTION_TOGGLE_CAMERA = "com.example.silent.action.TOGGLE_CAMERA"
         const val ACTION_PREVIEW_UPDATED = "com.example.silent.action.PREVIEW_UPDATED"
+        const val ACTION_LOG_MESSAGE = "com.example.silent.action.LOG_MESSAGE"
         const val EXTRA_CAMERA_LENS_FACING = "com.example.silent.extra.CAMERA_LENS_FACING"
         private const val CHANNEL_ID = "recording_channel"
         private const val TAG = "RecordingService"

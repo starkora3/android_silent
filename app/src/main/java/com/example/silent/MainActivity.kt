@@ -494,6 +494,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val logMessageReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == RecordingService.ACTION_LOG_MESSAGE) {
+                val message = intent.getStringExtra("log_message")
+                if (message != null) {
+                    runOnUiThread {
+                        appendLog(message)
+                    }
+                }
+            }
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         // bind to service if running
@@ -544,6 +557,10 @@ class MainActivity : AppCompatActivity() {
         val previewFilter = IntentFilter(RecordingService.ACTION_PREVIEW_UPDATED)
         try { safeRegisterReceiver(previewUpdateReceiver, previewFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver preview failed", e) }
 
+        // register receiver for log messages from service
+        val logFilter = IntentFilter(RecordingService.ACTION_LOG_MESSAGE)
+        try { safeRegisterReceiver(logMessageReceiver, logFilter) } catch (e: Exception) { android.util.Log.w("MainActivity", "registerReceiver log failed", e) }
+
         appendLog("onStart: receivers registered and service bind attempted")
     }
 
@@ -561,6 +578,7 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(cameraPermReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(serviceOnStartReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(previewUpdateReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(logMessageReceiver) } catch (_: Exception) {}
 
         // cancel any running timer countdowns to avoid leaks
         cancelTimerCountdown()
