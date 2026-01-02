@@ -100,11 +100,15 @@ class RecordingService : Service() {
 
     // 録画ファイル分割用
     private var fileSplitJob: Job? = null
-    private val SPLIT_INTERVAL_SECONDS = 15  // ファイル分割間隔（秒）
-    private val STATUS_LOG_INTERVAL_SECONDS = SPLIT_INTERVAL_SECONDS  // 録画ステータスログ出力間隔（秒）
-    private val TIMER_NOTIFICATION_INTERVAL_SECONDS = SPLIT_INTERVAL_SECONDS  // タイマー通知更新間隔（秒）
+    private var _splitInterval: Int = 60  // ファイル分割間隔（秒）
     private var isSplittingFile = false
     private var isAppInForeground = true
+
+    var splitInterval: Int
+        get() = _splitInterval
+        set(value){
+            _splitInterval = if(value>=5 && value<=60) value else 60
+        }
 
     inner class LocalBinder : Binder() {
         fun getService(): RecordingService = this@RecordingService
@@ -340,7 +344,7 @@ class RecordingService : Service() {
             return
         }
 
-        val interval  = SPLIT_INTERVAL_SECONDS
+        val interval  = _splitInterval
         activeRecording = vc.output
             .prepareRecording(this, mediaStoreOutput)
             .withAudioEnabled()
@@ -399,11 +403,11 @@ class RecordingService : Service() {
         fileSplitJob?.cancel()
         fileSplitJob = serviceScope.launch {
             while (isRecording && isAppInForeground) {
-                delay(SPLIT_INTERVAL_SECONDS * 1000L)
+                delay(_splitInterval * 1000L)
 
                 if (isRecording && isAppInForeground) {
                     Log.i(TAG, "========================================")
-                    sendLogToUI("${SPLIT_INTERVAL_SECONDS}秒経過: 録画ファイルを分割します")
+                    sendLogToUI("${_splitInterval}秒経過: 録画ファイルを分割します")
 
                     // ファイル分割フラグをセット
                     isSplittingFile = true
@@ -435,7 +439,7 @@ class RecordingService : Service() {
             }
             Log.d(TAG, "File split timer ended")
         }
-        Log.d(TAG, "File split timer started (${SPLIT_INTERVAL_SECONDS}s interval)")
+        Log.d(TAG, "File split timer started (${_splitInterval}s interval)")
     }
 
     // 録画を再開（ファイル分割用）
@@ -450,7 +454,7 @@ class RecordingService : Service() {
             .setContentValues(contentValues)
             .build()
 
-        val interval = STATUS_LOG_INTERVAL_SECONDS
+        val interval = _splitInterval
         activeRecording = vc.output
             .prepareRecording(this, mediaStoreOutput)
             .withAudioEnabled()
@@ -573,6 +577,7 @@ class RecordingService : Service() {
             Log.e(TAG, "Failed to acquire WakeLock", e)
         }
 
+        val interval = _splitInterval
         timerJob = CoroutineScope(Dispatchers.Main).launch {
             // Countdown to start
             for (i in startSec downTo 1) {
@@ -602,7 +607,7 @@ class RecordingService : Service() {
                 }
                 sendBroadcast(intent)
                 // Update notification only at significant intervals to reduce log spam
-                if (i == durSec || i <= 10 || i % TIMER_NOTIFICATION_INTERVAL_SECONDS == 0) {
+                if (i == durSec || i <= 10 || i % interval == 0) {
                     startForegroundNotification("録画中: 残り $i 秒")
                 }
                 delay(1000)
@@ -682,6 +687,10 @@ class RecordingService : Service() {
     }
 
     companion object {
+        private const val PREFS_NAME = "RecordingServicePrefs"
+        private const val PREF_SPLIT_INTERVAL = "split_interval_seconds"
+        const val DEFAULT_SPLIT_INTERVAL = 60  // デフォルト値（秒）
+
         const val ACTION_START = "com.example.silent.action.START_RECORDING"
         const val ACTION_STOP = "com.example.silent.action.STOP_RECORDING"
         const val ACTION_RECORDING_STARTED = "com.example.silent.action.RECORDING_STARTED"

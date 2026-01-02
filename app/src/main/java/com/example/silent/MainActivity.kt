@@ -65,6 +65,10 @@ class MainActivity : AppCompatActivity() {
     // 保存しておいたボタンの元のラベル（元に戻すため）
     private var timerButtonOriginalText: CharSequence? = null
 
+    // Split interval UI elements
+    private var splitIntervalInput: EditText? = null
+    private var setSplitIntervalButton: Button? = null
+
     // SharedPreferences keys for timer settings
     private val PREFS_NAME = "silent_prefs"
     private val KEY_TIMER_START_SEC = "timer_start_sec"
@@ -132,6 +136,11 @@ class MainActivity : AppCompatActivity() {
                     recordingState.text = formatMs(0L)
                 }
                 appendLog("Service connected. isRecording=$isRec")
+
+                // 分割秒数の表示を更新
+                recordingService?.let { service ->
+                    splitIntervalInput?.setText(service.splitInterval.toString())
+                }
             }
         }
 
@@ -620,6 +629,35 @@ class MainActivity : AppCompatActivity() {
                 timerStartInput?.setText(savedStart.toString())
                 timerDurationInput?.setText(savedDur.toString())
             } catch (_: Exception) {}
+
+            // --- Split interval UI setup ---
+            splitIntervalInput = findViewById(R.id.splitIntervalInput)
+            setSplitIntervalButton = findViewById(R.id.setSplitIntervalButton)
+
+            // 現在の設定値を表示
+            recordingService?.let { service ->
+                splitIntervalInput?.setText(service.splitInterval.toString())
+            } ?: run {
+                // サービス未接続時はデフォルト値を表示
+                splitIntervalInput?.setText(600.toString())
+            }
+
+            setSplitIntervalButton?.setOnClickListener {
+                try {
+                    val seconds = splitIntervalInput?.text?.toString()?.trim()?.toIntOrNull() ?: 30
+                    if (seconds < 5 || seconds > 600) {
+                        Toast.makeText(this, "5秒から600秒の範囲で設定してください", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+
+                    recordingService?.splitInterval = seconds
+                    Toast.makeText(this, "ファイル分割間隔を${seconds}秒に設定しました", Toast.LENGTH_SHORT).show()
+                    appendLog("ファイル分割間隔: ${seconds}秒に設定")
+                } catch (e: Exception) {
+                    Toast.makeText(this, "設定に失敗しました: ${e.message}", Toast.LENGTH_SHORT).show()
+                    appendLog("分割間隔設定エラー: ${e.message}")
+                }
+            }
 
             timerRecordButton?.setOnClickListener {
                 try {

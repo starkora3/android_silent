@@ -173,6 +173,43 @@
 
         </LinearLayout>
 
+        <LinearLayout
+            android:id="@+id/splitIntervalControls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:background="#88ffff"
+            android:gravity="center_vertical"
+            android:padding="8dp"
+            android:layout_marginTop="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="ファイル分割間隔:"
+                android:textColor="@color/black"
+                android:textSize="14sp" />
+
+            <EditText
+                android:id="@+id/splitIntervalInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="秒数 (5-600)"
+                android:inputType="number"
+                android:textColor="@color/black"
+                android:padding="8dp"
+                android:layout_marginStart="8dp" />
+
+            <Button
+                android:id="@+id/setSplitIntervalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="設定"
+                android:layout_marginStart="8dp" />
+
+        </LinearLayout>
+
         <ImageView
             android:id="@+id/previewImageView"
             android:layout_width="160dp"
